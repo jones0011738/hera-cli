@@ -1629,10 +1629,18 @@ def _serve_exec(c):
         out = f"[error] bad arguments: {exc}"
     except Exception as exc:  # noqa: BLE001
         out = f"[error] {type(exc).__name__}: {exc}"
-    if snap is not None and not str(out).startswith("[error]"):
+    is_err = str(out).startswith("[error]")
+    event = {"type": "tool_end", "name": name, "error": is_err, "output": out[:600]}
+    if snap is not None and not is_err:
         push_checkpoint(args.get("path", ""), snap, name)
-    _emit({"type": "tool_end", "name": name, "error": str(out).startswith("[error]"),
-           "output": out[:600]})
+        # Include before/after (capped) so the editor can show a native diff.
+        after_exist, after = _snapshot(args.get("path", ""))
+        event["diff"] = {
+            "path": _resolve(args.get("path", "")),
+            "before": (snap[1] or "")[:200_000],
+            "after": (after or "")[:200_000],
+        }
+    _emit(event)
     if len(out) > MAX_TOOL_OUTPUT:
         out = out[:MAX_TOOL_OUTPUT] + f"\n…[truncated, {len(out)} chars total]"
     return out

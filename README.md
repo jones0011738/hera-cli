@@ -9,6 +9,18 @@ commands, streams the model's reasoning, and tracks token usage.
 > Single file, no framework. Requires Python 3.7+ and `requests`.
 > This repo is kept in sync from the gpustack stack; see `scripts/sync-hera-cli.sh` there.
 
+## Other ways to access the same model
+
+This repo is the standalone **terminal CLI**. The same model and your same account are also
+reachable two other ways (provided by the full stack, not this repo):
+
+- **VS Code / Cursor** — an extension with a chat panel, in-editor diffs, and LSP-driven context
+  (it drives this CLI via `hera --serve`).
+- **Web** — an Open WebUI browser chat with per-user, email-based login.
+
+Your **Open WebUI API key** is the single credential across all three (terminal, editor, web).
+Ask your admin for the VS Code (`ACCESS_VSCODE.md`) and web (`ACCESS_WEB.md`) guides.
+
 ---
 
 ## Install

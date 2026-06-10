@@ -214,6 +214,13 @@ def _sgr(code):
     return f"\033[{code}m" if USE_COLOR else ""
 
 
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _strip_ansi(s):
+    return _ANSI_RE.sub("", s)
+
+
 R     = _sgr("0")
 BOLD  = _sgr("1")
 DIM   = _sgr("2")
@@ -1315,16 +1322,17 @@ def register_semantic_search():
     return True
 
 
-def register_extensions():
+def register_extensions(quiet=False):
     mcp = register_mcp()
     custom = register_custom_tools()
+    out = sys.stderr if quiet else sys.stdout   # serve mode keeps stdout JSON-only
     if mcp:
         print(f"{DIM}[ext] loaded {len(mcp)} MCP tool(s): {', '.join(mcp[:6])}"
-              f"{'…' if len(mcp) > 6 else ''}{R}")
+              f"{'…' if len(mcp) > 6 else ''}{R}", file=out)
     if custom:
-        print(f"{DIM}[ext] loaded {len(custom)} custom tool(s): {', '.join(custom)}{R}")
+        print(f"{DIM}[ext] loaded {len(custom)} custom tool(s): {', '.join(custom)}{R}", file=out)
     if register_semantic_search():
-        print(f"{DIM}[ext] semantic_search enabled (embeddings at {EMBED_URL}){R}")
+        print(f"{DIM}[ext] semantic_search enabled (embeddings at {EMBED_URL}){R}", file=out)
 
 
 def close_extensions():
@@ -1496,6 +1504,199 @@ def print_help():
     )
 
 
+# ── Headless JSON mode (for the VS Code webview) ──────────────────────────────
+# `hera --serve` speaks newline-delimited JSON on stdin/stdout so a GUI can drive
+# the full agent. stdout carries ONLY JSON events; logs go to stderr.
+#
+#   in : {"type":"prompt","text":...} | {"type":"approval","decision":"y|a|p|n"}
+#        | {"type":"undo"} | {"type":"clear"} | {"type":"exit"}
+#   out: ready | reasoning | token | tool_start | approval_request | tool_end
+#        | turn_end | info | error
+def _emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def _serve_read():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _serve_stream(messages):
+    try:
+        resp = requests.post(
+            f"{API_URL}/chat/completions",
+            json={"model": MODEL, "messages": messages, "tools": TOOL_SCHEMAS,
+                  "tool_choice": "auto", "stream": True,
+                  "stream_options": {"include_usage": True}},
+            headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+            stream=True, timeout=600,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        _emit({"type": "error", "message": str(exc)})
+        return None
+
+    content, tool_calls, usage, finish = [], {}, None, None
+    for raw in resp.iter_lines():
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="replace")
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload.strip() == "[DONE]":
+            break
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("usage"):
+            usage = obj["usage"]
+        choices = obj.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta", {})
+        if choices[0].get("finish_reason"):
+            finish = choices[0]["finish_reason"]
+        if delta.get("reasoning_content"):
+            _emit({"type": "reasoning", "delta": delta["reasoning_content"]})
+        if delta.get("content"):
+            content.append(delta["content"])
+            _emit({"type": "token", "delta": delta["content"]})
+        for tc in delta.get("tool_calls", []):
+            slot = tool_calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "arguments": ""})
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            fn = tc.get("function", {})
+            if fn.get("name"):
+                slot["name"] = fn["name"]
+            if fn.get("arguments"):
+                slot["arguments"] += fn["arguments"]
+    return {"content": "".join(content), "finish_reason": finish,
+            "tool_calls": [tool_calls[i] for i in sorted(tool_calls)], "usage": usage}
+
+
+def _serve_approve(name, args):
+    if YOLO or name not in SIDE_EFFECTS or name in _always_ok:
+        return True
+    if name == "run_bash" and bash_allowed(args.get("command", "")):
+        return True
+    _emit({"type": "approval_request", "name": name,
+           "preview": _strip_ansi(_preview_call(name, args)),
+           "command": args.get("command", "")})
+    while True:
+        msg = _serve_read()
+        if msg is None:
+            return "aborted (input closed)"
+        if msg.get("type") == "approval":
+            d = msg.get("decision", "n")
+            if d == "a" and name == "run_bash":
+                ALLOW_PATTERNS.append(" ".join(args.get("command", "").split()))
+            elif d == "a":
+                _always_ok.add(name)
+            elif d == "p" and name == "run_bash" and args.get("command", "").split():
+                ALLOW_PATTERNS.append(args["command"].split()[0] + " *")
+            return True if d in ("y", "a", "p") else "user declined"
+
+
+def _serve_exec(c):
+    name = c["name"]
+    try:
+        args = json.loads(c["arguments"] or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    _emit({"type": "tool_start", "name": name,
+           "preview": _strip_ansi(_preview_call(name, args))})
+    if name not in TOOLS:
+        out = f"[error] unknown tool: {name}"
+        _emit({"type": "tool_end", "name": name, "error": True, "output": out})
+        return out
+    verdict = _serve_approve(name, args)
+    if verdict is not True:
+        out = f"[denied] {verdict}"
+        _emit({"type": "tool_end", "name": name, "error": True, "output": out})
+        return out
+    snap = _snapshot(args.get("path", "")) if name in ("write_file", "edit_file") else None
+    try:
+        out = TOOLS[name](**args)
+    except TypeError as exc:
+        out = f"[error] bad arguments: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        out = f"[error] {type(exc).__name__}: {exc}"
+    if snap is not None and not str(out).startswith("[error]"):
+        push_checkpoint(args.get("path", ""), snap, name)
+    _emit({"type": "tool_end", "name": name, "error": str(out).startswith("[error]"),
+           "output": out[:600]})
+    if len(out) > MAX_TOOL_OUTPUT:
+        out = out[:MAX_TOOL_OUTPUT] + f"\n…[truncated, {len(out)} chars total]"
+    return out
+
+
+def _serve_run(messages):
+    turn = 0
+    for _ in range(MAX_STEPS):
+        res = _serve_stream(messages)
+        if res is None:
+            return
+        turn += _account(res.get("usage"))
+        calls = res["tool_calls"]
+        am = {"role": "assistant", "content": res["content"] or ""}
+        if calls:
+            am["tool_calls"] = [{"id": x["id"], "type": "function",
+                                 "function": {"name": x["name"], "arguments": x["arguments"]}}
+                                for x in calls]
+        messages.append(am)
+        if not calls:
+            _emit({"type": "turn_end", "content": res["content"] or "",
+                   "turn_tokens": turn, "session_tokens": dict(SESSION)})
+            return
+        for c in calls:
+            out = _serve_exec(c)
+            messages.append({"role": "tool", "tool_call_id": c["id"], "content": out})
+    _emit({"type": "turn_end", "content": "[stopped: hit MAX_STEPS]",
+           "turn_tokens": turn, "session_tokens": dict(SESSION)})
+
+
+def serve_main():
+    register_extensions(quiet=True)
+    CURRENT_SESSION["id"] = new_session_id()
+    CURRENT_SESSION["created"] = _now()
+    messages = [{"role": "system", "content": system_prompt()}]
+    _emit({"type": "ready", "name": NAME, "model": MODEL, "cwd": os.getcwd(),
+           "sandbox": sandbox_label(), "tools": list(TOOLS),
+           "needs_key": not bool(API_KEY)})
+    while True:
+        msg = _serve_read()
+        if msg is None:
+            break
+        t = msg.get("type")
+        if t == "exit":
+            break
+        if t == "prompt":
+            content, attached = expand_mentions(msg.get("text", ""))
+            if attached:
+                _emit({"type": "info", "text": f"attached: {', '.join(attached)}"})
+            messages.append({"role": "user", "content": content})
+            try:
+                _serve_run(messages)
+            except Exception as exc:  # noqa: BLE001
+                _emit({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+            save_session(messages)
+        elif t == "undo":
+            _emit({"type": "info", "text": undo_last()})
+        elif t == "clear":
+            messages[:] = [{"role": "system", "content": system_prompt()}]
+            _always_ok.clear()
+            _emit({"type": "info", "text": "conversation cleared"})
+    close_extensions()
+
+
 # ── REPL ──────────────────────────────────────────────────────────────────────
 def _start_new_session():
     CURRENT_SESSION["id"] = new_session_id()
@@ -1516,7 +1717,13 @@ def main():
                     help="continue the most recent session")
     ap.add_argument("--list-sessions", "-l", action="store_true",
                     help="list saved sessions and exit")
+    ap.add_argument("--serve", action="store_true",
+                    help="headless JSON mode over stdin/stdout (used by the VS Code extension)")
     args = ap.parse_args()
+
+    if args.serve:
+        serve_main()
+        return
 
     if args.list_sessions:
         print_sessions()

@@ -114,8 +114,11 @@ def _sandbox_argv(command):
     """Return (argv, use_shell) to execute `command` under the active sandbox."""
     cwd = os.getcwd()
     if SANDBOX_KIND == "bwrap":
-        argv = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-                "--bind", cwd, cwd, "--tmpfs", "/tmp",
+        # Order matters (later mounts win): make everything read-only, give a
+        # private /tmp, then bind the working dir writable LAST so it stays
+        # writable even when cwd is itself under /tmp.
+        argv = ["bwrap", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+                "--tmpfs", "/tmp", "--bind", cwd, cwd,
                 "--die-with-parent", "--chdir", cwd]
         if not SANDBOX_NET:
             argv += ["--unshare-net"]

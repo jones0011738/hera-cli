@@ -138,6 +138,24 @@ def _sandbox_argv(command):
     return command, True  # none → shell string
 
 
+def _sandbox_wrap_argv(argv):
+    """Wrap a program's argv under the active sandbox (for long-running children
+    like MCP servers). Returns argv unchanged when sandboxing is off."""
+    cwd = os.getcwd()
+    if SANDBOX_KIND == "bwrap":
+        pre = ["bwrap", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+               "--tmpfs", "/tmp", "--bind", cwd, cwd, "--die-with-parent", "--chdir", cwd]
+        if not SANDBOX_NET:
+            pre += ["--unshare-net"]
+        return pre + ["--"] + list(argv)
+    if SANDBOX_KIND == "unshare":
+        pre = ["unshare", "--user", "--map-root-user", "--fork", "--pid", "--mount-proc"]
+        if not SANDBOX_NET:
+            pre += ["--net"]
+        return pre + ["--"] + list(argv)
+    return list(argv)
+
+
 # ── Permission allowlist ──────────────────────────────────────────────────────
 # Patterns are fnmatch-style, matched against the full run_bash command string.
 # A command auto-approves only if it matches ALLOW and not DENY. DENY always wins.
@@ -420,21 +438,20 @@ def tool_semantic_search(query, path=".", k=8):
                 lines = f.read().splitlines()
         except (OSError, UnicodeDecodeError):
             continue
-        for i in range(0, len(lines), 40):
-            block = "\n".join(lines[i:i + 40]).strip()
+        for i in range(0, len(lines), 20):
+            block = "\n".join(lines[i:i + 20]).strip()
             if block:
-                chunks.append((fp, i + 1, block))
-        if len(chunks) >= 400:
+                chunks.append((fp, i + 1, block[:1200]))  # keep within embed ctx
+        if len(chunks) >= 600:
             break
     if not chunks:
         return f"(no code to search under {base})"
     try:
-        qvec = _embed([query])[0]
-        # batch chunk embeddings to keep requests reasonable
+        qvec = _embed([query[:1200]])[0]
         vecs = []
-        texts = [c[2][:2000] for c in chunks]
-        for j in range(0, len(texts), 64):
-            vecs.extend(_embed(texts[j:j + 64]))
+        texts = [c[2] for c in chunks]
+        for j in range(0, len(texts), 32):  # small batches → stay under embed ctx
+            vecs.extend(_embed(texts[j:j + 32]))
     except Exception as exc:  # noqa: BLE001
         return f"[error] embeddings request failed: {exc}"
     scored = sorted(zip(chunks, vecs), key=lambda cv: _cosine(qvec, cv[1]), reverse=True)
@@ -672,7 +689,7 @@ def approve(name, args):
 
 
 # ── Streaming chat call ───────────────────────────────────────────────────────
-def stream_turn(messages, spinner):
+def stream_turn(messages, spinner, tools=None):
     """One model turn. Streams reasoning + content live; assembles tool calls.
 
     Returns dict {content, finish_reason, tool_calls, usage} or None on error.
@@ -683,7 +700,7 @@ def stream_turn(messages, spinner):
             json={
                 "model": MODEL,
                 "messages": messages,
-                "tools": TOOL_SCHEMAS,
+                "tools": tools if tools is not None else TOOL_SCHEMAS,
                 "tool_choice": "auto",
                 "stream": True,
                 "stream_options": {"include_usage": True},
@@ -867,46 +884,105 @@ def run_agent(messages, spinner):
             return True
 
         for c in calls:
-            name = c["name"]
-            try:
-                args = json.loads(c["arguments"] or "{}")
-            except json.JSONDecodeError:
-                args = {}
-
-            print(f"\n{BLUE}● {name}{R} {DIM}{_preview_call(name, args).splitlines()[0]}{R}")
-
-            if name not in TOOLS:
-                output = f"[error] unknown tool: {name}"
-            else:
-                verdict = approve(name, args)
-                if verdict is not True:
-                    output = f"[denied] {verdict}"
-                    print(f"  {RED}✗ {verdict}{R}")
-                else:
-                    # Snapshot file state before a mutating edit so /undo can revert it.
-                    snap = _snapshot(args.get("path", "")) if name in ("write_file", "edit_file") else None
-                    try:
-                        output = TOOLS[name](**args)
-                    except TypeError as exc:
-                        output = f"[error] bad arguments: {exc}"
-                    except Exception as exc:  # noqa: BLE001 — surface to the model
-                        output = f"[error] {type(exc).__name__}: {exc}"
-                    if snap is not None and not str(output).startswith("[error]"):
-                        push_checkpoint(args.get("path", ""), snap, name)
-                    preview = output.splitlines()[0] if output else "(no output)"
-                    print(f"  {DIM}{preview[:100]}{R}")
-
-            if len(output) > MAX_TOOL_OUTPUT:
-                output = output[:MAX_TOOL_OUTPUT] + f"\n…[truncated, {len(output)} chars total]"
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": c["id"],
-                "content": output,
-            })
+            output = _exec_call(c)
+            messages.append({"role": "tool", "tool_call_id": c["id"], "content": output})
 
     print(f"\n{RED}[stopped] hit MAX_STEPS={MAX_STEPS} tool round-trips{R}\n")
     return True
+
+
+def _exec_call(c, indent=""):
+    """Execute one tool call: print, approve, checkpoint, run. Returns output string."""
+    name = c["name"]
+    try:
+        args = json.loads(c["arguments"] or "{}")
+    except json.JSONDecodeError:
+        args = {}
+
+    print(f"\n{indent}{BLUE}● {name}{R} {DIM}{_preview_call(name, args).splitlines()[0]}{R}")
+
+    if name not in TOOLS:
+        return f"[error] unknown tool: {name}"
+
+    verdict = approve(name, args)
+    if verdict is not True:
+        print(f"{indent}  {RED}✗ {verdict}{R}")
+        return f"[denied] {verdict}"
+
+    # Snapshot file state before a mutating edit so /undo can revert it.
+    snap = _snapshot(args.get("path", "")) if name in ("write_file", "edit_file") else None
+    try:
+        output = TOOLS[name](**args)
+    except TypeError as exc:
+        output = f"[error] bad arguments: {exc}"
+    except Exception as exc:  # noqa: BLE001 — surface to the model
+        output = f"[error] {type(exc).__name__}: {exc}"
+    if snap is not None and not str(output).startswith("[error]"):
+        push_checkpoint(args.get("path", ""), snap, name)
+    print(f"{indent}  {DIM}{(output.splitlines()[0] if output else '(no output)')[:100]}{R}")
+
+    if len(output) > MAX_TOOL_OUTPUT:
+        output = output[:MAX_TOOL_OUTPUT] + f"\n…[truncated, {len(output)} chars total]"
+    return output
+
+
+# ── Sub-agents / task delegation ──────────────────────────────────────────────
+def run_subagent(description):
+    """Run a focused nested agent on `description`; return its final answer text.
+
+    The sub-agent has every tool except `task` itself (so it can't recurse),
+    shares the approval gate / sandbox / checkpoints, and reports indented
+    progress. Only its final summary goes back to the parent.
+    """
+    sub_schemas = [s for s in TOOL_SCHEMAS if s["function"]["name"] != "task"]
+    msgs = [
+        {"role": "system", "content":
+            f"You are a focused sub-agent of {NAME}. Complete the delegated task using your "
+            f"tools in {os.getcwd()}, then reply with a concise summary of what you found or "
+            f"changed. Be thorough but terse."},
+        {"role": "user", "content": description},
+    ]
+    spinner = Spinner()
+    print(f"\n  {BLUE}⤷ sub-agent started{R} {DIM}{description[:70]}{R}")
+    final = ""
+    for _ in range(MAX_STEPS):
+        spinner.start()
+        res = stream_turn(msgs, spinner, tools=sub_schemas)
+        if res is None:
+            return "[sub-agent error] transport failure"
+        _account(res.get("usage"))
+        calls = res["tool_calls"]
+        am = {"role": "assistant", "content": res["content"] or ""}
+        if calls:
+            am["tool_calls"] = [{"id": c["id"], "type": "function",
+                                 "function": {"name": c["name"], "arguments": c["arguments"]}}
+                                for c in calls]
+        msgs.append(am)
+        if not calls:
+            final = res["content"] or ""
+            break
+        for c in calls:
+            out = _exec_call(c, indent="    ")
+            msgs.append({"role": "tool", "tool_call_id": c["id"], "content": out})
+    print(f"  {BLUE}⤷ sub-agent done{R}")
+    return final or "(sub-agent produced no result)"
+
+
+def tool_task(description, **_ignored):
+    return run_subagent(description)
+
+
+TOOLS["task"] = tool_task
+TOOL_SCHEMAS.append({"type": "function", "function": {
+    "name": "task",
+    "description": ("Delegate a self-contained subtask to a focused sub-agent that has the "
+                    "same tools and returns a concise result. Use for multi-step research or "
+                    "work you want handled in one shot (e.g. 'find and summarize all places "
+                    "that read config')."),
+    "parameters": {"type": "object", "properties": {
+        "description": {"type": "string", "description": "The subtask, with enough context to act on"},
+    }, "required": ["description"]},
+}})
 
 
 # ── Session persistence / resume ──────────────────────────────────────────────
@@ -1002,6 +1078,7 @@ def print_sessions():
 # ── Extensions: MCP servers + custom tools ────────────────────────────────────
 MCP_CONFIG = os.path.expanduser(_env("HERA_MCP_CONFIG",
                                      default="~/.config/hera/mcp.json"))
+MCP_SANDBOX = _truthy(_env("HERA_MCP_SANDBOX"))  # run MCP servers under the sandbox
 CUSTOM_TOOLS_PATHS = [
     os.path.expanduser("~/.config/hera/tools.py"),
     os.path.join(os.getcwd(), ".hera", "tools.py"),
@@ -1022,8 +1099,11 @@ class McpClient:
         self.name = name
         full_env = dict(os.environ)
         full_env.update(env or {})
+        argv = [command] + list(args or [])
+        if MCP_SANDBOX:
+            argv = _sandbox_wrap_argv(argv)
         self.proc = subprocess.Popen(
-            [command] + list(args or []),
+            argv,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1, env=full_env,
         )
@@ -1214,7 +1294,8 @@ def system_prompt():
         "be available for fuzzy 'where is the code that…' questions. "
         "Use glob/search/symbols to locate relevant code, then read files before changing "
         "anything; make edits with precise old_string/new_string. File edits are revertible "
-        "by the user with /undo. "
+        "by the user with /undo. For larger self-contained subtasks you may delegate to a "
+        "focused sub-agent with the task tool. "
         "Keep prose short — act with tools rather than describing what you would do. "
         "When the task is complete, give a brief summary of what you changed."
     )
@@ -1300,7 +1381,7 @@ def print_banner():
         row(f"context →  {fn}", dim=True)
     print(f"{CYAN}│{R}{' ' * W}{CYAN}│{R}")
     row("tools: list_dir read_file glob search symbols", dim=True)
-    row("       write_file edit_file run_bash", dim=True)
+    row("       write_file edit_file run_bash task", dim=True)
     row("/undo /diff /compact /sessions /tools /help", dim=True)
     print(f"{CYAN}╰{'─' * W}╯{R}\n")
 

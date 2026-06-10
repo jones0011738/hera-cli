@@ -63,6 +63,7 @@ that edits files or runs a command (`[y]es / [a]lways / [n]o`). Read-only tools 
 | `write_file` | Create / overwrite a file | prompts |
 | `edit_file` | Exact string replacement in a file | prompts |
 | `run_bash` | Run a shell command | prompts |
+| `task` | Delegate a subtask to a focused sub-agent (own tool loop) | runs (inner calls prompt) |
 
 ## In-session commands
 
@@ -122,8 +123,14 @@ HERA_TOOLS = [{
 }]
 ```
 
-MCP and custom tools require approval unless `read_only`, and run **outside** the `run_bash`
-sandbox.
+MCP and custom tools require approval unless `read_only`. Set `HERA_MCP_SANDBOX=1` to launch
+MCP servers (third-party binaries) under the `run_bash` sandbox (fs confined to cwd, network
+off with `bwrap`). Custom Python tools run in-process and aren't sandboxed — but you author
+them, so they're trusted by construction; MCP servers are the untrusted surface.
+
+**Sub-agents:** the `task` tool delegates a self-contained subtask to a focused sub-agent that
+has the full toolset (minus `task`, so no recursion), shares the approval gate / sandbox /
+checkpoints, and returns a concise result.
 
 ## Sandboxing & permissions
 
@@ -160,6 +167,7 @@ into its system prompt and follows its conventions — like Claude Code's `CLAUD
 | `HERA_DENY` | _(empty)_ | Extra deny patterns (added to the built-in list) |
 | `HERA_SESSIONS_DIR` | `~/.config/hera/sessions` | Where session transcripts are saved |
 | `HERA_MCP_CONFIG` | `~/.config/hera/mcp.json` | MCP servers config (Claude-Desktop shape) |
+| `HERA_MCP_SANDBOX` | `0` | `1` = run MCP servers under the `run_bash` sandbox |
 | `HERA_EMBED_URL` | = `HERA_API_URL` | Embeddings endpoint for `semantic_search` (server needs `--embeddings`) |
 | `HERA_EMBED_MODEL` | = `HERA_MODEL` | Model name for embeddings requests |
 

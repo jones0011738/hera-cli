@@ -231,9 +231,30 @@ into its system prompt and follows its conventions — like Claude Code's `CLAUD
 | `HERA_MCP_SANDBOX` | `0` | `1` = run MCP servers under the `run_bash` sandbox |
 | `HERA_EMBED_URL` | = `HERA_API_URL` | Embeddings endpoint for `semantic_search` (server needs `--embeddings`) |
 | `HERA_EMBED_MODEL` | = `HERA_MODEL` | Model name for embeddings requests |
+| `HERA_NO_UPDATE_CHECK` | `0` | `1` = don't check for or show the update notice |
 
 > Legacy `QWEN_*` variables (and `LLAMA_API_KEY`) are honoured as fallbacks.
 > `semantic_search` is enabled only when the embeddings endpoint responds; otherwise use `symbols` + `search`.
+
+---
+
+## Updating
+
+Current release: **0.5.1**. On launch Hera checks the published version (at most once a day,
+fail-silent) and prints a one-line notice when a newer one is out:
+
+```
+↑ update available: Hera 0.5.1 (you have 0.5.0)
+  re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
+```
+
+To update, re-run the one-line installer, or pull the single file directly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jones0011738/hera-cli/main/hera.py -o "$(command -v hera || echo ~/.local/bin/hera)"
+```
+
+Your config and saved sessions are untouched. Silence the notice with `HERA_NO_UPDATE_CHECK=1`.
 
 ---
 

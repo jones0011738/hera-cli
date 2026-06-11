@@ -219,10 +219,34 @@ A `HERA.md` (or `AGENTS.md`/`AGENT.md`) in the launch directory is loaded into t
 | `HERA_MCP_SANDBOX` | `0` | `1` = run MCP servers under the sandbox. |
 | `HERA_EMBED_URL` / `HERA_EMBED_MODEL` | = API | Embeddings endpoint for `semantic_search`. |
 | `HERA_SESSIONS_DIR` | `~/.config/hera/sessions` | Session store root (namespaced per user). |
+| `HERA_NO_UPDATE_CHECK` | `0` | `1` = don't check for or show the update notice. |
 
 ---
 
-## 6. Troubleshooting
+## 6. Keeping Hera up to date
+
+The current release is **0.5.1**. On launch Hera checks the published version (at most once a
+day, fail-silent — it never blocks or errors startup). If a newer one is out, you'll see a
+one-line notice like:
+
+```
+↑ update available: Hera 0.5.1 (you have 0.5.0)
+  re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
+```
+
+To update, either re-run the one-line installer from step 2, or pull the latest single file:
+
+```bash
+curl -fsSL http://<HOST>:8081/hera.py -o "$(command -v hera || echo ~/.local/bin/hera)"
+# raw-GitHub installs instead use: https://raw.githubusercontent.com/jones0011738/hera-cli/main/hera.py
+```
+
+Your config and saved sessions are untouched by an update. Set `HERA_NO_UPDATE_CHECK=1` to silence
+the notice.
+
+---
+
+## 7. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|

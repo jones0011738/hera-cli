@@ -93,11 +93,14 @@ that edits files or runs a command (`[y]es / [a]lways / [n]o`). Read-only tools 
 | `run_bash` | Run a shell command (offers to install a missing program, then retries) | prompts |
 | `web_search` | Search the live web when Hera lacks info (auto-triggered) | auto |
 | `web_fetch` | Fetch a page's readable text (e.g. a docs URL) | auto |
+| `install_tool` | Download & install a program Hera decides it needs | prompts |
 | `task` | Delegate a subtask to a focused sub-agent (own tool loop) | runs (inner calls prompt) |
 
 Web tools let Hera look things up on its own when it's missing information; disable with
-`HERA_NO_WEB=1`. When a `run_bash` command hits a missing binary, Hera asks whether to
-install it (apt/dnf/pacman/brew/apk) and re-runs the command — disable with `HERA_NO_AUTOINSTALL=1`.
+`HERA_NO_WEB=1`. Hera can also pull in tools it needs: it calls **`install_tool`** (you approve
+first) to download a program it decides the task requires, or — if a `run_bash` command hits a
+missing binary — it asks whether to install it (apt/dnf/pacman/brew/apk) and re-runs the
+command. Either way nothing is downloaded without your OK. Disable with `HERA_NO_AUTOINSTALL=1`.
 Pick `[a]lways` at a `write_file` prompt and Hera creates files on its own for the rest of the session.
 
 ## In-session commands

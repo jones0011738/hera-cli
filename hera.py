@@ -606,8 +606,27 @@ def _install_plan(program):
     return None
 
 
+def _do_install(program):
+    """Run the install plan for `program` (unsandboxed). Returns (ok, message).
+
+    The package manager needs the network and writes to system dirs, so this is
+    deliberately NOT run under the run_bash sandbox.
+    """
+    plan = _install_plan(program)
+    if not plan:
+        return False, f"no supported package manager found to install '{program}'"
+    proc = subprocess.run(plan, shell=True, capture_output=True, text=True)
+    if proc.returncode == 0 and shutil.which(program):
+        return True, f"installed {program} → {shutil.which(program)}"
+    detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    hint = detail[-1] if detail else f"exit {proc.returncode}"
+    if "password" in (proc.stderr or "").lower():
+        hint = "needs sudo (no password available here) — install it manually"
+    return False, f"install failed: {hint}"
+
+
 def _offer_install(program):
-    """Ask the user, then try to install `program`. Returns True on success."""
+    """Reactive path: a run_bash command hit a missing binary. Ask, then install."""
     if not AUTO_INSTALL:
         return False
     plan = _install_plan(program)
@@ -625,17 +644,23 @@ def _offer_install(program):
     if ans not in ("y", "yes", ""):
         return False
     print(f"  {DIM}installing… (this runs outside the sandbox, with network){R}")
-    # Install must reach the network and write system dirs, so it is NOT sandboxed.
-    proc = subprocess.run(plan, shell=True, capture_output=True, text=True)
-    if proc.returncode == 0 and shutil.which(program):
-        print(f"  {GREEN}✓ installed {program}{R}")
-        return True
-    detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-    hint = detail[-1] if detail else f"exit {proc.returncode}"
-    if "password" in (proc.stderr or "").lower():
-        hint = "needs sudo (no password available here) — install it manually"
-    print(f"  {RED}✗ install failed: {hint}{R}")
-    return False
+    ok, msg = _do_install(program)
+    print(f"  {GREEN}✓ {msg}{R}" if ok else f"  {RED}✗ {msg}{R}")
+    return ok
+
+
+def tool_install(program, reason=""):
+    """Proactive path: the model decided it needs `program`. Approval is handled
+    by the side-effect gate before this runs, so here we just install it."""
+    program = (program or "").strip().split()[0] if program else ""
+    if not program:
+        return "[error] no program specified"
+    existing = shutil.which(program)
+    if existing:
+        return f"{program} is already installed ({existing})"
+    print(f"  {DIM}installing {program}… (outside the sandbox, with network){R}")
+    ok, msg = _do_install(program)
+    return msg if ok else f"[error] {msg}"
 
 
 def tool_run_bash(command, timeout=120, _retry=False):
@@ -841,6 +866,12 @@ def _diff_preview(old, new):
 def _preview_call(name, args):
     if name == "run_bash":
         return f"$ {args.get('command', '')}"
+    if name == "install_tool":
+        prog = args.get("program", "?")
+        reason = args.get("reason", "")
+        plan = _install_plan(prog) or "no package manager available"
+        head = f"install {prog}" + (f"  — {reason}" if reason else "")
+        return f"{head}\n    $ {plan}"
     if name == "write_file":
         c = args.get("content", "")
         n = c.count("\n") + 1
@@ -1233,6 +1264,26 @@ if WEB_ENABLED:
     }})
 
 
+# install_tool lets the model proactively request a program it needs. It's a
+# side-effect (downloads + installs software) so the user must approve it via
+# the normal gate before anything is fetched. Disable with HERA_NO_AUTOINSTALL=1.
+if AUTO_INSTALL:
+    TOOLS["install_tool"] = tool_install
+    SIDE_EFFECTS.add("install_tool")
+    TOOL_SCHEMAS.append({"type": "function", "function": {
+        "name": "install_tool",
+        "description": ("Install a command-line program/tool you need for the task but "
+                        "that isn't available yet (e.g. jq, ripgrep, a formatter, a CLI). "
+                        "The user is asked to approve before anything is downloaded; once "
+                        "approved it's installed with the system package manager and you "
+                        "can then use it via run_bash. Give a short reason."),
+        "parameters": {"type": "object", "properties": {
+            "program": {"type": "string", "description": "The command/binary name to install, e.g. 'jq'"},
+            "reason":  {"type": "string", "description": "Why you need it (one short phrase)"},
+        }, "required": ["program"]},
+    }})
+
+
 # ── Session persistence / resume ──────────────────────────────────────────────
 def _user_id():
     """Stable per-user id so sessions never mix on a shared machine.
@@ -1614,9 +1665,12 @@ def system_prompt():
                  "versions, an unfamiliar error — call web_search on your own initiative "
                  "(then web_fetch a result if you need its full text) rather than guessing.")
     if AUTO_INSTALL:
-        base += (" If a shell command fails because a program isn't installed, just try it; "
-                 "the user will be asked whether to install the missing tool and the command "
-                 "is retried automatically — so don't give up on a 'command not found'.")
+        base += (" When the task needs a command-line tool that isn't installed, call "
+                 "install_tool with the program name and a short reason; the user approves, "
+                 "then it's downloaded and you can use it via run_bash. You may also just run "
+                 "a command — if it fails with 'command not found' the user is offered the "
+                 "install and the command is retried automatically. Either way, don't give up "
+                 "because a tool is missing.")
     fn, body = load_project_context()
     if body:
         base += (f"\n\nThe project provides a context file ({fn}). Follow its "

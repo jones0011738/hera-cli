@@ -37,9 +37,16 @@ import time
 import threading
 
 try:
-    import readline  # noqa: F401  (enables line editing in input())
+    import readline  # noqa: F401  (enables line editing in the input() fallback)
 except ImportError:
     pass
+
+try:
+    import termios
+    import tty
+except ImportError:  # non-POSIX (e.g. Windows) — raw mode unavailable
+    termios = None
+    tty = None
 
 try:
     import requests
@@ -234,6 +241,7 @@ YELL  = _sgr("93")
 BLUE  = _sgr("94")
 MAG   = _sgr("95")
 GREY  = _sgr("90")
+REV   = _sgr("7")
 TEAL  = _sgr("38;5;44")
 SKY   = _sgr("38;5;39")
 IND    = _sgr("38;5;33")
@@ -1492,7 +1500,7 @@ def print_banner():
     row("tools", f"{len(TOOLS)} available")
     print(rule)
     print(f"  {DIM}type a task  ·  {R}{CYAN}@path{R}{DIM} to attach a file  ·  "
-          f"{R}{CYAN}/{R}{DIM} + {R}{CYAN}Tab{R}{DIM} for commands{R}\n")
+          f"press {R}{CYAN}/{R}{DIM} for commands{R}\n")
 
 
 # ── Slash commands ────────────────────────────────────────────────────────────
@@ -1586,6 +1594,257 @@ def setup_completion():
         readline.parse_and_bind("set completion-query-items 200")
 
 
+# ── Raw-mode prompt with a live slash-command dropdown ────────────────────────
+# A self-contained line editor (no third-party deps). It mirrors Claude Code:
+# the moment the line starts with "/", a filtering menu pops up under the
+# prompt — arrow keys move the highlight, Tab/Enter accept it, typing filters,
+# Backspace past the "/" closes it. Falls back to input() when stdin isn't a
+# TTY (pipes, the --serve path) or on platforms without termios.
+INPUT_HISTORY = []
+_MENU_LABEL_W = 22  # column width reserved for the "/cmd [args]" label
+
+
+def _menu_active(buf):
+    """The dropdown shows while the buffer is a bare, still-unfinished /command."""
+    return re.fullmatch(r"/[A-Za-z-]*", buf) is not None
+
+
+def _menu_matches(buf):
+    return [c for c in SLASH_COMMANDS if c[0].startswith(buf.lower())]
+
+
+class RawLineReader:
+    """One-line raw-mode editor with the slash-command dropdown."""
+
+    def __init__(self, prompt):
+        self.prompt = prompt
+        self.pw = len(_strip_ansi(prompt))
+        self.fd = sys.stdin.fileno()
+        self.buf = ""
+        self.pos = 0          # cursor index within buf
+        self.sel = 0          # highlighted menu row
+        self.hist = len(INPUT_HISTORY)  # index into history (== len means "current")
+        self.stash = ""       # buffer stashed while browsing history
+        self.prev_row = 0     # screen-row offset of the cursor after last render
+
+    # — key decoding ————————————————————————————————————————————————
+    def _key(self):
+        b = os.read(self.fd, 1)
+        if not b:
+            return "EOF"
+        c = b[0]
+        simple = {0x03: "CTRL_C", 0x04: "CTRL_D", 0x01: "HOME", 0x05: "END",
+                  0x0b: "CTRL_K", 0x15: "CTRL_U", 0x17: "CTRL_W",
+                  0x0d: "ENTER", 0x0a: "ENTER", 0x09: "TAB",
+                  0x7f: "BACKSPACE", 0x08: "BACKSPACE"}
+        if c in simple:
+            return simple[c]
+        if c == 0x1b:
+            return self._escape()
+        if c < 0x20:
+            return None  # ignore other control bytes
+        # printable / start of a UTF-8 sequence
+        n = 1 if c < 0x80 else (2 if c >> 5 == 0b110 else (3 if c >> 4 == 0b1110 else 4))
+        if n > 1:
+            b += os.read(self.fd, n - 1)
+        try:
+            return b.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    def _escape(self):
+        r, _, _ = select.select([self.fd], [], [], 0.03)
+        if not r:
+            return "ESC"
+        nxt = os.read(self.fd, 1)
+        if nxt not in (b"[", b"O"):
+            return "ESC"
+        final = os.read(self.fd, 1)
+        arrows = {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT",
+                  b"H": "HOME", b"F": "END"}
+        if final in arrows:
+            return arrows[final]
+        if final in (b"1", b"3", b"4", b"7", b"8"):
+            while True:  # consume the trailing "~"
+                t = os.read(self.fd, 1)
+                if not t or t == b"~":
+                    break
+            return {b"1": "HOME", b"7": "HOME", b"4": "END", b"8": "END",
+                    b"3": "DELETE"}.get(final, "ESC")
+        return "ESC"
+
+    # — rendering ————————————————————————————————————————————————————
+    def _menu_lines(self, matches, width):
+        rows = []
+        desc_budget = max(0, width - 3 - _MENU_LABEL_W - 1)
+        for i, (name, args, desc) in enumerate(matches):
+            label = f"{name} {args}".rstrip()
+            descT = desc[:desc_budget]
+            if i == self.sel:
+                vis = f"{label:<{_MENU_LABEL_W}} {descT}"
+                vis = vis[:width - 3]
+                rows.append(f"{REV} ❯ {vis}{' ' * (width - 3 - len(vis))}{R}")
+            else:
+                rows.append(f"   {CYAN}{label:<{_MENU_LABEL_W}}{R} {DIM}{descT}{R}")
+        return rows
+
+    def _render(self, menu_rows):
+        width = max(20, shutil.get_terminal_size((80, 24)).columns)
+        out = []
+        if self.prev_row:
+            out.append(f"\033[{self.prev_row}A")
+        out.append("\r\033[J")                 # to prompt row, clear everything below
+        out.append(self.prompt + self.buf)
+        for row in menu_rows:
+            out.append("\r\n" + row)
+        end_cells = self.pw + len(self.buf)
+        cur_phys = end_cells // width + len(menu_rows)
+        tgt_cells = self.pw + self.pos
+        tgt_row, tgt_col = divmod(tgt_cells, width)
+        up = cur_phys - tgt_row
+        if up > 0:
+            out.append(f"\033[{up}A")
+        out.append("\r")
+        if tgt_col:
+            out.append(f"\033[{tgt_col}C")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+        self.prev_row = tgt_row
+
+    def _refresh(self):
+        if _menu_active(self.buf):
+            matches = _menu_matches(self.buf)
+            self.sel = min(self.sel, len(matches) - 1) if matches else 0
+            self._render(self._menu_lines(matches, max(20, shutil.get_terminal_size((80, 24)).columns)))
+        else:
+            self._render([])
+
+    def _close(self):
+        """Erase the menu, drop to a fresh line below the (full) buffer."""
+        self.pos = len(self.buf)
+        self._render([])
+        sys.stdout.write("\r\n")
+        sys.stdout.flush()
+
+    # — main loop ————————————————————————————————————————————————————
+    def read(self):
+        old = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
+        try:
+            self._refresh()
+            while True:
+                key = self._key()
+                active = _menu_active(self.buf)
+                matches = _menu_matches(self.buf) if active else []
+
+                if key == "ENTER":
+                    if active and matches:
+                        name, args, _ = matches[self.sel]
+                        if args:                      # needs an argument: fill, keep editing
+                            self.buf, self.pos, self.sel = name + " ", len(name) + 1, 0
+                            self._refresh()
+                            continue
+                        self.buf = name               # no-arg command: submit it
+                    self._close()
+                    return self.buf
+                if key == "TAB":
+                    if active and matches:
+                        name = matches[self.sel][0]
+                        self.buf, self.pos, self.sel = name + " ", len(name) + 1, 0
+                        self._refresh()
+                    continue
+                if key == "UP":
+                    if active and matches:
+                        self.sel = max(0, self.sel - 1)
+                    else:
+                        self._history(-1)
+                    self._refresh(); continue
+                if key == "DOWN":
+                    if active and matches:
+                        self.sel = min(len(matches) - 1, self.sel + 1)
+                    else:
+                        self._history(1)
+                    self._refresh(); continue
+                if key == "LEFT":
+                    self.pos = max(0, self.pos - 1); self._refresh(); continue
+                if key == "RIGHT":
+                    self.pos = min(len(self.buf), self.pos + 1); self._refresh(); continue
+                if key == "HOME":
+                    self.pos = 0; self._refresh(); continue
+                if key == "END":
+                    self.pos = len(self.buf); self._refresh(); continue
+                if key == "BACKSPACE":
+                    if self.pos:
+                        self.buf = self.buf[:self.pos - 1] + self.buf[self.pos:]
+                        self.pos -= 1; self.sel = 0
+                    self._refresh(); continue
+                if key == "DELETE":
+                    if self.pos < len(self.buf):
+                        self.buf = self.buf[:self.pos] + self.buf[self.pos + 1:]
+                        self.sel = 0
+                    self._refresh(); continue
+                if key == "CTRL_U":
+                    self.buf = self.buf[self.pos:]; self.pos = 0; self.sel = 0
+                    self._refresh(); continue
+                if key == "CTRL_K":
+                    self.buf = self.buf[:self.pos]; self.sel = 0; self._refresh(); continue
+                if key == "CTRL_W":
+                    self._delete_word(); self._refresh(); continue
+                if key == "ESC":
+                    self.buf = ""; self.pos = 0; self.sel = 0; self._refresh(); continue
+                if key == "CTRL_C":
+                    self._close(); raise KeyboardInterrupt
+                if key in ("CTRL_D", "EOF"):
+                    if not self.buf:
+                        self._close(); raise EOFError
+                    if self.pos < len(self.buf):       # otherwise act as delete-forward
+                        self.buf = self.buf[:self.pos] + self.buf[self.pos + 1:]
+                        self.sel = 0; self._refresh()
+                    continue
+                if isinstance(key, str) and key >= " ":
+                    self.buf = self.buf[:self.pos] + key + self.buf[self.pos:]
+                    self.pos += len(key); self.sel = 0; self._refresh()
+        finally:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, old)
+
+    def _history(self, step):
+        if step < 0:
+            if self.hist > 0:
+                if self.hist == len(INPUT_HISTORY):
+                    self.stash = self.buf
+                self.hist -= 1
+                self.buf = INPUT_HISTORY[self.hist]
+        else:
+            if self.hist < len(INPUT_HISTORY):
+                self.hist += 1
+                self.buf = (INPUT_HISTORY[self.hist] if self.hist < len(INPUT_HISTORY)
+                            else self.stash)
+        self.pos = len(self.buf); self.sel = 0
+
+    def _delete_word(self):
+        i = self.pos
+        while i > 0 and self.buf[i - 1] == " ":
+            i -= 1
+        while i > 0 and self.buf[i - 1] != " ":
+            i -= 1
+        self.buf = self.buf[:i] + self.buf[self.pos:]
+        self.pos = i; self.sel = 0
+
+
+def read_line(prompt):
+    """Read one line of input, with the live slash-menu when on a real TTY."""
+    use_raw = (termios is not None and sys.stdin.isatty() and sys.stdout.isatty())
+    if not use_raw:
+        return input(prompt)
+    try:
+        line = RawLineReader(prompt).read()
+    except termios.error:
+        return input(prompt)
+    if line.strip() and (not INPUT_HISTORY or INPUT_HISTORY[-1] != line):
+        INPUT_HISTORY.append(line)
+    return line
+
+
 def print_help():
     print(f"\n{DIM}"
           f"  Ask me to build, fix, explain, or refactor code. I work in the\n"
@@ -1595,8 +1854,8 @@ def print_help():
     for name, args, desc in SLASH_COMMANDS:
         print(_slash_row(name, args, desc))
     print(f"\n{DIM}"
-          f"  Tip: type {R}{CYAN}/{R}{DIM} then {R}{CYAN}Tab{R}{DIM} to autocomplete a command,\n"
-          f"  or send a bare {R}{CYAN}/{R}{DIM} to see this list.\n\n"
+          f"  Tip: press {R}{CYAN}/{R}{DIM} to open this menu inline — {R}{CYAN}↑{R}{DIM}/{R}{CYAN}↓{R}{DIM} to\n"
+          f"  pick, {R}{CYAN}Tab{R}{DIM} or {R}{CYAN}Enter{R}{DIM} to accept, keep typing to filter.\n\n"
           f"  Start with --resume [ID] / --continue to pick up a past session,\n"
           f"  or --list-sessions to see them.{R}\n")
 
@@ -1881,7 +2140,7 @@ def _repl(messages, spinner):
     global HIDE_REASONING
     while True:
         try:
-            user_input = input(f"{ACCENT}{BOLD}❯{R} ").strip()
+            user_input = read_line(f"{ACCENT}{BOLD}❯{R} ").strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Session ended.{R}")
             break

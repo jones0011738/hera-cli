@@ -625,6 +625,28 @@ def _do_install(program):
     return False, f"install failed: {hint}"
 
 
+# Headless (--serve) mode sets this so the reactive "missing binary" install
+# offer surfaces as an IDE approval button instead of a terminal input() prompt.
+# Signature: (program, plan) -> bool.
+_INSTALL_APPROVER = None
+
+
+def _confirm_install(program, plan):
+    """Get consent to install `program`. YOLO auto-approves; in --serve mode it
+    routes through the IDE approval hook; otherwise it prompts on the terminal."""
+    if YOLO:
+        return True
+    if _INSTALL_APPROVER is not None:
+        return bool(_INSTALL_APPROVER(program, plan))
+    print(f"\n{YELL}{BOLD}⚠ '{program}' is not installed.{R}", file=sys.stderr)
+    print(f"  {DIM}proposed:{R} {plan}", file=sys.stderr)
+    try:
+        ans = input(f"{BOLD}  install it now? [y]es / [n]o:{R} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return ans in ("y", "yes", "")
+
+
 def _offer_install(program):
     """Reactive path: a run_bash command hit a missing binary. Ask, then install."""
     if not AUTO_INSTALL:
@@ -632,19 +654,9 @@ def _offer_install(program):
     plan = _install_plan(program)
     if not plan:
         return False
-    print(f"\n{YELL}{BOLD}⚠ '{program}' is not installed.{R}", file=sys.stderr)
-    print(f"  {DIM}proposed:{R} {plan}", file=sys.stderr)
-    if YOLO:
-        ans = "y"
-    else:
-        try:
-            ans = input(f"{BOLD}  install it now? [y]es / [n]o:{R} ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return False
-    if ans not in ("y", "yes", ""):
+    if not _confirm_install(program, plan):
         return False
-    print(f"  {DIM}installing… (this runs outside the sandbox, with network){R}",
-          file=sys.stderr)
+    print(f"  {DIM}installing… (outside the sandbox, with network){R}", file=sys.stderr)
     ok, msg = _do_install(program)
     print(f"  {GREEN}✓ {msg}{R}" if ok else f"  {RED}✗ {msg}{R}", file=sys.stderr)
     return ok
@@ -686,7 +698,7 @@ def tool_run_bash(command, timeout=120, _retry=False):
     if not _retry:
         prog = _missing_program(command, err, proc.returncode)
         if prog and _offer_install(prog):
-            print(f"  {DIM}↳ re-running: {command}{R}")
+            print(f"  {DIM}↳ re-running: {command}{R}", file=sys.stderr)
             return tool_run_bash(command, timeout, _retry=True)
 
     parts = []
@@ -2241,6 +2253,22 @@ def _serve_approve(name, args):
             return True if d in ("y", "a", "p") else "user declined"
 
 
+def _serve_install_approver(program, plan):
+    """IDE approval for the reactive run_bash → missing-binary install offer.
+
+    Emits the same approval_request event the editor already renders as buttons,
+    then blocks on the editor's decision (read from the JSON stdin stream)."""
+    _emit({"type": "approval_request", "name": "install_tool",
+           "preview": f"install {program}  — required by the last command\n    $ {plan}",
+           "command": ""})
+    while True:
+        msg = _serve_read()
+        if msg is None:
+            return False
+        if msg.get("type") == "approval":
+            return msg.get("decision", "n") in ("y", "a", "p")
+
+
 def _serve_exec(c):
     name = c["name"]
     try:
@@ -2308,9 +2336,12 @@ def _serve_run(messages):
 
 
 def serve_main():
+    global _INSTALL_APPROVER
     if not API_URL:
         _emit({"type": "error", "message": "no server set — set HERA_API_URL"})
         return
+    # Reactive missing-binary installs ask via the editor, not a terminal prompt.
+    _INSTALL_APPROVER = _serve_install_approver
     register_extensions(quiet=True)
     CURRENT_SESSION["id"] = new_session_id()
     CURRENT_SESSION["created"] = _now()

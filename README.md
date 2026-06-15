@@ -255,11 +255,11 @@ the live catalog the proxy is serving.
 
 ## Updating
 
-Current release: **0.7.1**. On launch Hera checks the published version (at most once a day,
+Current release: **0.8.0**. On launch Hera checks the published version (at most once a day,
 fail-silent) and prints a one-line notice when a newer one is out:
 
 ```
-↑ update available: Hera 0.7.1 (you have 0.6.1)
+↑ update available: Hera 0.8.0 (you have 0.6.1)
   re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
 ```
 

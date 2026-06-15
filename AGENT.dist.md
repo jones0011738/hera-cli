@@ -14,7 +14,7 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.7.1`.
+- **Version:** `0.8.0`.
 - **Shared skills:** the CLI now has `/skills` and `/skills <id>`, backed by the proxy's
   authenticated `GET /skills` endpoint. Shared prompt/workflow skills live upstream in
   `shared-skills/skills/*.md`, can trigger automatically or via `@skill:<id>` / `/skill <id>`,

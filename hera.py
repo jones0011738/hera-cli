@@ -17,10 +17,22 @@ Optional:       HERA_MODEL          (default qwen3.6-35b-a3b)
                 HERA_MAX_STEPS      max tool round-trips per message (default 25)
                 HERA_HIDE_REASONING=1   don't stream the model's thinking
                 HERA_NO_SUGGESTIONS=1   don't print "Next steps" tips after a task
+                HERA_PLAN=1         start in plan mode (investigate & propose,
+                                    no edits until you /plan to approve)
+                HERA_PRICE_IN / HERA_PRICE_OUT   USD per 1M tokens → show $ cost
+                HERA_CONTEXT_TOKENS / HERA_AUTO_COMPACT_AT   auto-compact history
+                                    when it nears the context window (default 32000, 0.8)
                 HERA_VISION_URL     vision endpoint for image attachments (the
                                     main model is text-only; without this, images
                                     are attached but not interpreted)
                 HERA_VISION_MODEL   model name at HERA_VISION_URL
+
+Config file (~/.config/hera/config.json) also supports:
+    "hooks":       {"PreToolUse":[{"matcher":"run_bash","command":"…"}], "PostToolUse":[…], "Stop":[…]}
+    "permissions": {"allow":["run_bash(git *)"], "ask":["write_file"], "deny":["run_bash(rm *)"]}
+    "price_in"/"price_out", "context_tokens", "auto_compact_at"
+Custom slash commands live in ~/.config/hera/commands/*.md ($ARGUMENTS),
+named sub-agents in ~/.config/hera/agents/*.md (optional `tools:` frontmatter).
 
 Legacy QWEN_* variables (and LLAMA_API_KEY) are still honoured as fallbacks.
 """
@@ -45,6 +57,7 @@ import select
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 import urllib.parse as _urlparse
@@ -139,7 +152,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.7.1"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.0"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -180,6 +193,40 @@ SANDBOX_NET  = _cfg_truthy("HERA_SANDBOX_NET", key="sandbox_net", default=True)
 
 # Running token usage for the whole session.
 SESSION = {"prompt": 0, "completion": 0, "total": 0, "requests": 0}
+
+# ── Claude-parity feature config ──────────────────────────────────────────────
+# Cost estimate: USD price per 1M tokens. 0 (the default) hides the $ display.
+PRICE_IN  = float(_cfg("HERA_PRICE_IN",  key="price_in",  default="0") or 0)
+PRICE_OUT = float(_cfg("HERA_PRICE_OUT", key="price_out", default="0") or 0)
+
+# Auto-compaction: when the estimated prompt size crosses AUTO_COMPACT_AT * the
+# context window, the history is summarized before the next turn. 0 disables.
+CONTEXT_TOKENS  = int(_cfg("HERA_CONTEXT_TOKENS", key="context_tokens", default="32000") or 0)
+AUTO_COMPACT_AT = float(_cfg("HERA_AUTO_COMPACT_AT", key="auto_compact_at", default="0.8") or 0)
+
+# User hooks: config["hooks"] = {"PreToolUse":[{"matcher":"run_bash","command":"..."}],
+# "PostToolUse":[...], "Stop":[...]}. A PreToolUse hook exiting non-zero blocks the tool.
+HOOKS = _FILE_CFG.get("hooks") if isinstance(_FILE_CFG.get("hooks"), dict) else {}
+
+# Fine-grained permissions: config["permissions"] = {"allow":[...],"ask":[...],"deny":[...]}.
+# Each entry is "tool" or "tool(<glob>)" — e.g. "run_bash(git *)", "edit_file(src/**)".
+_PERMS = _FILE_CFG.get("permissions") if isinstance(_FILE_CFG.get("permissions"), dict) else {}
+
+# Plan mode: read-only investigation; mutating tools are blocked until the user
+# approves the plan (toggle with /plan, or a {"type":"plan"} message in --serve).
+PLAN_MODE = _truthy(_env("HERA_PLAN"))
+
+# In-task to-do list (Claude-Code-style). Items: {"content": str, "status": ...}.
+TODOS = []
+
+# Background run_bash jobs: id -> {"proc", "out_path", "command", "started"}.
+_BG_JOBS = {}
+_BG_SEQ = 0
+
+# Where custom slash-commands and named sub-agents live.
+CONFIG_DIR   = os.path.dirname(CONFIG_PATH) or os.path.expanduser("~/.config/hera")
+COMMANDS_DIR = os.path.join(CONFIG_DIR, "commands")
+AGENTS_DIR   = os.path.join(CONFIG_DIR, "agents")
 
 # Set (by the ESC watcher thread in the CLI, or a {"type":"interrupt"} message in
 # --serve mode) to ask the current model turn to stop mid-stream. Cleared at the
@@ -847,7 +894,9 @@ def tool_install(program, reason=""):
     return msg if ok else f"[error] {msg}"
 
 
-def tool_run_bash(command, timeout=120, _retry=False):
+def tool_run_bash(command, timeout=120, run_in_background=False, _retry=False):
+    if run_in_background:
+        return _bash_background_start(command)
     argv, use_shell = _sandbox_argv(command)
     try:
         proc = subprocess.run(
@@ -1023,6 +1072,9 @@ TOOL_SCHEMAS = [
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string", "description": "Shell command to run"},
             "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"},
+            "run_in_background": {"type": "boolean", "description": ("Start a long-running command "
+                "(server, watcher, build) detached and return a job id immediately; read its output "
+                "later with bash_output. Default false.")},
         }, "required": ["command"]},
     }},
 ]
@@ -1158,13 +1210,32 @@ def _type_feedback():
 
 def approve(name, args):
     """Return True to run the tool, or a string denial reason."""
-    if YOLO or name not in SIDE_EFFECTS or name in _always_ok:
+    # Plan mode: block anything that changes state until the user approves.
+    if PLAN_MODE and name in SIDE_EFFECTS:
+        return ("plan mode is on — outline the plan and stop. Modifying tools stay disabled "
+                "until the user approves (they exit plan mode with /plan).")
+
+    # Fine-grained permission rules (from config) take precedence over YOLO/allowlist.
+    decision = _perm_decision(name, args)
+    if decision == "deny":
+        return "denied by a permission rule"
+
+    # PreToolUse hooks may veto any tool call.
+    blocked = _run_hooks("PreToolUse", name, args)
+    if blocked:
+        return blocked
+
+    if decision == "allow":
+        return True
+
+    # A 'ask' rule forces a prompt even for read-only tools / under YOLO.
+    if decision != "ask" and (YOLO or name not in SIDE_EFFECTS or name in _always_ok):
         return True
 
     # run_bash: consult the command allowlist first.
     if name == "run_bash":
         cmd = args.get("command", "")
-        if bash_allowed(cmd):
+        if decision != "ask" and bash_allowed(cmd):
             print(f"  {DIM}↳ auto-approved (allowlist){R}")
             return True
         denied = _matches(cmd, DENY_PATTERNS)
@@ -1472,6 +1543,7 @@ def run_agent(messages, spinner):
     """Drive the reason→act loop until the model produces a final answer."""
     turn_tokens = 0
     did_work = False   # did this turn actually use tools? (gates next-step tips)
+    _maybe_auto_compact(messages)
     for step in range(MAX_STEPS):
         spinner.start()
         # Only the streaming call watches for ESC — tool approvals use input()
@@ -1489,7 +1561,7 @@ def run_agent(messages, spinner):
             messages.append({"role": "assistant",
                              "content": result["content"] or "(interrupted)"})
             print(f"{GREY}  {turn_tokens} tok this turn · {SESSION['total']} session"
-                  f"  · stopped by ESC{R}\n")
+                  f"{_cost_suffix()}  · stopped by ESC{R}\n")
             return True
 
         calls = result["tool_calls"]
@@ -1509,7 +1581,9 @@ def run_agent(messages, spinner):
 
         if not calls:
             print(f"\n{GREY}{'─' * 50}{R}")
-            print(f"{GREY}  {turn_tokens} tok this turn · {SESSION['total']} session{R}\n")
+            print(f"{GREY}  {turn_tokens} tok this turn · {SESSION['total']} session"
+                  f"{_cost_suffix()}{R}\n")
+            _run_hooks("Stop")
             if did_work:
                 _suggest_next_steps(messages)
             return True
@@ -1685,6 +1759,10 @@ def _exec_call(c, indent=""):
     preview = (output.splitlines()[0] if output else "(no output)")[:100]
     is_err = str(output).startswith("[error]")
     print(f"{indent}  {GREY}⎿{R} {(RED if is_err else GREY)}{preview}{R}")
+    # Show the refreshed checklist right after a to-do update.
+    if name == "todo_write" and TODOS and not is_err:
+        print(_render_todos_text())
+    _run_hooks("PostToolUse", name, args, output)
 
     if len(output) > MAX_TOOL_OUTPUT:
         output = output[:MAX_TOOL_OUTPUT] + f"\n…[truncated, {len(output)} chars total]"
@@ -1692,23 +1770,34 @@ def _exec_call(c, indent=""):
 
 
 # ── Sub-agents / task delegation ──────────────────────────────────────────────
-def run_subagent(description):
+def run_subagent(description, agent=None):
     """Run a focused nested agent on `description`; return its final answer text.
 
     The sub-agent has every tool except `task` itself (so it can't recurse),
     shares the approval gate / sandbox / checkpoints, and reports indented
-    progress. Only its final summary goes back to the parent.
+    progress. Only its final summary goes back to the parent. A named agent
+    definition (from ~/.config/hera/agents/<name>.md) can supply its own system
+    prompt and restrict the tool set via a `tools:` frontmatter list.
     """
     sub_schemas = [s for s in TOOL_SCHEMAS if s["function"]["name"] != "task"]
+    sys_prompt = (f"You are a focused sub-agent of {NAME}. Complete the delegated task using your "
+                  f"tools in {os.getcwd()}, then reply with a concise summary of what you found or "
+                  f"changed. Be thorough but terse.")
+    label = "sub-agent"
+    if agent and agent in CUSTOM_AGENTS:
+        meta, body = _parse_frontmatter(CUSTOM_AGENTS[agent])
+        if body.strip():
+            sys_prompt = body.strip() + f"\n\nWork in {os.getcwd()}. Reply with a concise summary."
+        label = f"agent:{agent}"
+        allowed = [t.strip() for t in (meta.get("tools", "")).replace(",", " ").split() if t.strip()]
+        if allowed:
+            sub_schemas = [s for s in sub_schemas if s["function"]["name"] in allowed]
     msgs = [
-        {"role": "system", "content":
-            f"You are a focused sub-agent of {NAME}. Complete the delegated task using your "
-            f"tools in {os.getcwd()}, then reply with a concise summary of what you found or "
-            f"changed. Be thorough but terse."},
+        {"role": "system", "content": sys_prompt},
         {"role": "user", "content": description},
     ]
     spinner = Spinner()
-    print(f"\n  {BLUE}⤷ sub-agent started{R} {DIM}{description[:70]}{R}")
+    print(f"\n  {BLUE}⤷ {label} started{R} {DIM}{description[:70]}{R}")
     final = ""
     for _ in range(MAX_STEPS):
         spinner.start()
@@ -1730,12 +1819,12 @@ def run_subagent(description):
         for c in calls:
             out = _exec_call(c, indent="    ")
             msgs.append({"role": "tool", "tool_call_id": c["id"], "content": out})
-    print(f"  {BLUE}⤷ sub-agent done{R}")
+    print(f"  {BLUE}⤷ {label} done{R}")
     return final or "(sub-agent produced no result)"
 
 
-def tool_task(description, **_ignored):
-    return run_subagent(description)
+def tool_task(description, agent=None, **_ignored):
+    return run_subagent(description, agent=agent)
 
 
 TOOLS["task"] = tool_task
@@ -1744,9 +1833,11 @@ TOOL_SCHEMAS.append({"type": "function", "function": {
     "description": ("Delegate a self-contained subtask to a focused sub-agent that has the "
                     "same tools and returns a concise result. Use for multi-step research or "
                     "work you want handled in one shot (e.g. 'find and summarize all places "
-                    "that read config')."),
+                    "that read config'). Optionally target a named agent (configured under "
+                    "~/.config/hera/agents) with its own instructions via the `agent` field."),
     "parameters": {"type": "object", "properties": {
         "description": {"type": "string", "description": "The subtask, with enough context to act on"},
+        "agent": {"type": "string", "description": "Optional named agent to use"},
     }, "required": ["description"]},
 }})
 
@@ -1798,6 +1889,225 @@ if AUTO_INSTALL:
             "reason":  {"type": "string", "description": "Why you need it (one short phrase)"},
         }, "required": ["program"]},
     }})
+
+
+# ── Claude-parity features: cost · to-dos · hooks · permissions · plan · jobs ──
+
+def _session_cost():
+    """Estimated session cost in USD, or None when no pricing is configured."""
+    if PRICE_IN <= 0 and PRICE_OUT <= 0:
+        return None
+    return (SESSION["prompt"] / 1e6) * PRICE_IN + (SESSION["completion"] / 1e6) * PRICE_OUT
+
+
+def _cost_suffix():
+    c = _session_cost()
+    return f" · ${c:.4f}" if c is not None else ""
+
+
+# ----- to-do list (Claude-Code-style task checklist) -------------------------
+_TODO_MARK = {"completed": "✔", "in_progress": "▸", "pending": "○"}
+
+
+def tool_todo_write(todos, **_ignored):
+    """Replace the working to-do list. `todos` = list of {content, status}."""
+    global TODOS
+    clean = []
+    for t in (todos or []):
+        if not isinstance(t, dict):
+            continue
+        content = str(t.get("content", "")).strip()
+        if not content:
+            continue
+        status = t.get("status", "pending")
+        if status not in _TODO_MARK:
+            status = "pending"
+        clean.append({"content": content, "status": status})
+    TODOS = clean
+    done = sum(1 for t in clean if t["status"] == "completed")
+    return f"updated plan ({done}/{len(clean)} done)"
+
+
+def _render_todos_text():
+    lines = []
+    for t in TODOS:
+        m = _TODO_MARK.get(t["status"], "○")
+        body = t["content"]
+        if t["status"] == "completed":
+            body = f"{GREY}{body}{R}"
+        elif t["status"] == "in_progress":
+            body = f"{BOLD}{body}{R}"
+        lines.append(f"  {ACCENT}{m}{R} {body}")
+    return "\n".join(lines)
+
+
+TOOLS["todo_write"] = tool_todo_write
+TOOL_SCHEMAS.append({"type": "function", "function": {
+    "name": "todo_write",
+    "description": ("Maintain a visible to-do checklist for the current task. Call this at the "
+                    "start of any multi-step task to lay out the steps, and again after each step "
+                    "to mark it completed and set the next one in_progress. Keep exactly one item "
+                    "in_progress at a time. Skip it for trivial single-step requests."),
+    "parameters": {"type": "object", "properties": {
+        "todos": {"type": "array", "description": "The full updated list (replaces the previous one)",
+                  "items": {"type": "object", "properties": {
+                      "content": {"type": "string", "description": "Short imperative step"},
+                      "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                  }, "required": ["content", "status"]}},
+    }, "required": ["todos"]},
+}})
+
+
+# ----- background shell jobs --------------------------------------------------
+def _bash_background_start(command):
+    """Launch a long-running command detached; return a job id immediately."""
+    global _BG_SEQ
+    argv, use_shell = _sandbox_argv(command)
+    try:
+        out = tempfile.NamedTemporaryFile(prefix="hera-bg-", suffix=".log",
+                                          delete=False, mode="w")
+        proc = subprocess.Popen(argv, shell=use_shell, stdout=out, stderr=subprocess.STDOUT,
+                                 cwd=os.getcwd(), text=True)
+    except Exception as exc:  # noqa: BLE001
+        return f"[error] could not start background job: {exc}"
+    _BG_SEQ += 1
+    jid = f"bg{_BG_SEQ}"
+    _BG_JOBS[jid] = {"proc": proc, "out_path": out.name, "command": command,
+                     "started": time.time()}
+    out.close()
+    return (f"started background job {jid} (pid {proc.pid}): {command}\n"
+            f"Use bash_output('{jid}') to read its output, bash_kill('{jid}') to stop it.")
+
+
+def tool_bash_output(id, **_ignored):
+    """Read accumulated output (and status) of a background job."""
+    job = _BG_JOBS.get(id)
+    if not job:
+        return f"[error] no background job {id!r} (active: {', '.join(_BG_JOBS) or 'none'})"
+    rc = job["proc"].poll()
+    try:
+        with open(job["out_path"], "r", encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except OSError:
+        data = ""
+    if len(data) > MAX_TOOL_OUTPUT:
+        data = data[-MAX_TOOL_OUTPUT:]
+    status = "running" if rc is None else f"exited ({rc})"
+    return f"job {id} [{status}] {job['command']}\n{data or '(no output yet)'}"
+
+
+def tool_bash_kill(id, **_ignored):
+    """Terminate a background job."""
+    job = _BG_JOBS.get(id)
+    if not job:
+        return f"[error] no background job {id!r}"
+    try:
+        job["proc"].terminate()
+    except Exception as exc:  # noqa: BLE001
+        return f"[error] could not kill {id}: {exc}"
+    return f"killed background job {id}"
+
+
+TOOLS["bash_output"] = tool_bash_output
+TOOLS["bash_kill"] = tool_bash_kill
+SIDE_EFFECTS.add("bash_kill")
+TOOL_SCHEMAS.append({"type": "function", "function": {
+    "name": "bash_output",
+    "description": "Read the current output and status of a background job started with run_bash(run_in_background=true).",
+    "parameters": {"type": "object", "properties": {
+        "id": {"type": "string", "description": "The job id, e.g. 'bg1'"}}, "required": ["id"]},
+}})
+TOOL_SCHEMAS.append({"type": "function", "function": {
+    "name": "bash_kill",
+    "description": "Stop a running background job by id.",
+    "parameters": {"type": "object", "properties": {
+        "id": {"type": "string", "description": "The job id, e.g. 'bg1'"}}, "required": ["id"]},
+}})
+
+
+# ----- user hooks -------------------------------------------------------------
+def _run_hooks(event, name=None, args=None, output=None):
+    """Run configured hooks for an event. Returns a denial string if a PreToolUse
+    hook blocks the tool, else None. Hook failures never crash a turn."""
+    for spec in (HOOKS.get(event) or []):
+        if not isinstance(spec, dict) or not spec.get("command"):
+            continue
+        matcher = spec.get("matcher")
+        if matcher and name is not None and not fnmatch.fnmatch(name, matcher):
+            continue
+        env = dict(os.environ, HERA_HOOK_EVENT=event)
+        if name is not None:
+            env["HERA_TOOL_NAME"] = name
+        if args is not None:
+            env["HERA_TOOL_ARGS"] = json.dumps(args)[:8000]
+        payload = json.dumps({"event": event, "tool": name, "args": args,
+                              "output": (output or "")[:4000]})
+        try:
+            r = subprocess.run(spec["command"], shell=True, input=payload, text=True,
+                               capture_output=True, timeout=30, env=env, cwd=os.getcwd())
+        except Exception:  # noqa: BLE001 — a broken hook must not break the agent
+            continue
+        if event == "PreToolUse" and r.returncode != 0:
+            reason = (r.stdout or r.stderr or "").strip() or "blocked by PreToolUse hook"
+            return f"hook blocked: {reason[:200]}"
+    return None
+
+
+# ----- fine-grained permissions ----------------------------------------------
+def _perm_match(entry, name, args):
+    """Does a permission entry ('tool' or 'tool(<glob>)') match this call?"""
+    m = re.match(r"^([A-Za-z_]+)(?:\((.*)\))?$", str(entry).strip())
+    if not m or m.group(1) != name:
+        return False
+    glob = m.group(2)
+    if glob is None:
+        return True
+    target = " ".join(str(args.get("command") or args.get("path") or "").split())
+    return fnmatch.fnmatch(target, glob.strip())
+
+
+def _perm_decision(name, args):
+    """Return 'allow' / 'deny' / 'ask' from config permissions, or None if no rule."""
+    for bucket in ("deny", "ask", "allow"):
+        for entry in (_PERMS.get(bucket) or []):
+            if _perm_match(entry, name, args):
+                return bucket
+    return None
+
+
+# ----- custom slash commands & named sub-agents ------------------------------
+def _load_markdown_dir(path):
+    """Return {name: text} for *.md files in `path` (name = filename without .md)."""
+    out = {}
+    try:
+        for fn in sorted(os.listdir(path)):
+            if fn.endswith(".md"):
+                try:
+                    with open(os.path.join(path, fn), encoding="utf-8", errors="replace") as f:
+                        out[fn[:-3]] = f.read()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def _parse_frontmatter(text):
+    """Split optional YAML-ish '---' frontmatter (key: value) from the body."""
+    meta = {}
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end != -1:
+            for line in text[4:end].splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    meta[k.strip()] = v.strip()
+            text = text[end + 4:].lstrip("\n")
+    return meta, text
+
+
+CUSTOM_COMMANDS = _load_markdown_dir(COMMANDS_DIR)
+CUSTOM_AGENTS = _load_markdown_dir(AGENTS_DIR)
 
 
 # ── Session persistence / resume ──────────────────────────────────────────────
@@ -2286,6 +2596,13 @@ def system_prompt():
         "Keep prose short — act with tools rather than describing what you would do. "
         "When the task is complete, give a brief summary of what you changed."
     )
+    base += (" For any task with more than ~3 steps, call todo_write first to lay out the plan as "
+             "a checklist, then update it as you go — mark each step completed and set the next one "
+             "in_progress, keeping exactly one in_progress at a time. Skip it for trivial requests.")
+    if PLAN_MODE:
+        base += (" PLAN MODE IS ON. Do NOT modify files, run state-changing commands, or install "
+                 "anything. Investigate with read-only tools, then present a concise numbered plan "
+                 "of what you would do and STOP — the user will review and approve before execution.")
     if WEB_ENABLED:
         base += (" You have live internet access. Whenever the answer depends on information you "
                  "don't already hold — current events, recent releases, library or API docs, exact "
@@ -2397,6 +2714,37 @@ def compact_history(messages):
     return f"compacted to a summary ({len(summary)} chars); history reset"
 
 
+def _estimate_tokens(messages):
+    """Rough token estimate (~4 chars/token) across the message list."""
+    total = 0
+    for m in messages:
+        total += len(_text_of(m.get("content")))
+        for tc in (m.get("tool_calls") or []):
+            total += len(json.dumps(tc.get("function", {})))
+    return total // 4
+
+
+def _maybe_auto_compact(messages, emit=None):
+    """Summarize history when it nears the context window. `emit(dict)` is the
+    --serve event sink; when None we print to the terminal."""
+    if CONTEXT_TOKENS <= 0 or AUTO_COMPACT_AT <= 0 or len(messages) <= 4:
+        return
+    est = _estimate_tokens(messages)
+    if est < AUTO_COMPACT_AT * CONTEXT_TOKENS:
+        return
+    note = f"context ~{est} tok nearing the {CONTEXT_TOKENS} limit — auto-compacting…"
+    result_prefix = "auto-compact: "
+    if emit:
+        emit({"type": "info", "text": note})
+    else:
+        print(f"\n{DIM}  {note}{R}")
+    result = compact_history(messages)
+    if emit:
+        emit({"type": "info", "text": result_prefix + result})
+    else:
+        print(f"{DIM}  {result_prefix}{result}{R}\n")
+
+
 # ── Banner / help ──────────────────────────────────────────────────────────────
 # (VERSION is defined once near the top of the file.)
 
@@ -2459,7 +2807,9 @@ SLASH_COMMANDS = [
     ("/undo",      "",          "revert the last file write/edit I made"),
     ("/diff",      "",          "show the working-tree git diff"),
     ("/compact",   "",          "summarize the conversation to free up context"),
-    ("/tokens",    "",          "show token usage this session"),
+    ("/tokens",    "",          "show token usage (and cost, if priced) this session"),
+    ("/plan",      "",          "toggle plan mode (investigate & propose before editing)"),
+    ("/todos",     "",          "show the current to-do checklist"),
     ("/tools",     "",          "list the tools I can use"),
     ("/allow",     "[pattern]", "list run_bash allow patterns, or add one"),
     ("/sandbox",   "",          "show the run_bash sandbox status"),
@@ -2855,6 +3205,10 @@ def _serve_input_thread():
             _INTERRUPT.set()
         elif t == "approval":
             _APPROVAL_Q.put(msg)
+        elif t == "plan":
+            global PLAN_MODE
+            PLAN_MODE = bool(msg.get("on", not PLAN_MODE))
+            _emit({"type": "info", "text": f"plan mode {'on' if PLAN_MODE else 'off'}"})
         else:
             _MAIN_Q.put(msg)
 
@@ -3018,6 +3372,10 @@ def _serve_exec(c):
             "after": (after or "")[:200_000],
         }
     _emit(event)
+    # Push the refreshed checklist to the editor after a to-do update.
+    if name == "todo_write" and not is_err:
+        _emit({"type": "todos", "items": list(TODOS)})
+    _run_hooks("PostToolUse", name, args, out)
     if len(out) > MAX_TOOL_OUTPUT:
         out = out[:MAX_TOOL_OUTPUT] + f"\n…[truncated, {len(out)} chars total]"
     return out
@@ -3026,6 +3384,7 @@ def _serve_exec(c):
 def _serve_run(messages):
     turn = 0
     did_work = False   # used tools this turn? gates the next-step suggestions
+    _maybe_auto_compact(messages, emit=_emit)
     for _ in range(MAX_STEPS):
         res = _serve_stream(messages)
         if res is None:
@@ -3048,7 +3407,9 @@ def _serve_run(messages):
         messages.append(am)
         if not calls:
             _emit({"type": "turn_end", "content": res["content"] or "",
-                   "turn_tokens": turn, "session_tokens": dict(SESSION)})
+                   "turn_tokens": turn, "session_tokens": dict(SESSION),
+                   "cost": _session_cost()})
+            _run_hooks("Stop")
             # End-of-task next-step tips for the editor UI (same feature the
             # interactive CLI prints). Emitted after turn_end so the panel has
             # already unblocked; best-effort, so a failure is silently dropped.
@@ -3346,7 +3707,7 @@ def _repl(messages, spinner):
         if cmd == "/tokens":
             s = SESSION
             print(f"\n{DIM}session: {s['total']} tokens over {s['requests']} requests "
-                  f"(prompt {s['prompt']} / completion {s['completion']}){R}\n")
+                  f"(prompt {s['prompt']} / completion {s['completion']}){_cost_suffix()}{R}\n")
             continue
         if cmd == "/tools":
             print(f"\n{DIM}tools: {', '.join(TOOLS)}\n"
@@ -3378,11 +3739,42 @@ def _repl(messages, spinner):
             state = "hidden" if HIDE_REASONING else "visible"
             print(f"\n{DIM}reasoning is now {state}.{R}\n")
             continue
+        if cmd == "/plan":
+            globals()["PLAN_MODE"] = not PLAN_MODE
+            if PLAN_MODE:
+                print(f"\n{DIM}plan mode ON — I'll investigate and propose a plan; edits/commands "
+                      f"are disabled until you /plan again to approve.{R}\n")
+            else:
+                print(f"\n{DIM}plan mode OFF — I can edit and run again.{R}\n")
+            continue
+        if cmd == "/todos":
+            if TODOS:
+                print("\n" + _render_todos_text() + "\n")
+            else:
+                print(f"\n{DIM}no to-do list yet.{R}\n")
+            continue
+
+        # User-defined slash commands from ~/.config/hera/commands/*.md.
+        first = user_input.split()[0]
+        cust = CUSTOM_COMMANDS.get(first[1:]) if first.startswith("/") else None
+        if cust is not None:
+            _, body = _parse_frontmatter(cust)
+            cmd_args = user_input[len(first):].strip()
+            prompt_text = body.replace("$ARGUMENTS", cmd_args).strip()
+            mark = len(messages)
+            messages.append({"role": "user", "content": prompt_text})
+            try:
+                ok = run_agent(messages, spinner)
+            except KeyboardInterrupt:
+                spinner.stop(); print(f"\n{DIM}(interrupted){R}\n"); ok = True
+            if not ok:
+                del messages[mark:]
+            save_session(messages)
+            continue
 
         # Anything else that looks like a "/command" (and not a path like
         # /etc/hosts) is an unknown command — show the recommendation menu
         # instead of forwarding it to the model.
-        first = user_input.split()[0]
         if re.fullmatch(r"/[A-Za-z][A-Za-z-]*", first):
             print_slash_menu(user_input)
             continue

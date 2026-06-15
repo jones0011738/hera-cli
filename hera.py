@@ -16,6 +16,7 @@ Optional:       HERA_MODEL          (default qwen3.6-35b-a3b)
                 HERA_YOLO=1         auto-approve every tool call (no prompts)
                 HERA_MAX_STEPS      max tool round-trips per message (default 25)
                 HERA_HIDE_REASONING=1   don't stream the model's thinking
+                HERA_NO_SUGGESTIONS=1   don't print "Next steps" tips after a task
                 HERA_VISION_URL     vision endpoint for image attachments (the
                                     main model is text-only; without this, images
                                     are attached but not interpreted)
@@ -38,6 +39,7 @@ import math
 import mimetypes
 import os
 import queue
+import random
 import re
 import select
 import shutil
@@ -137,7 +139,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.6.3"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.7.0"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -439,8 +441,22 @@ def render_md_line(line, state):
 
 
 # ── Spinner ───────────────────────────────────────────────────────────────────
+# Whimsical present-progressive status words shown while Hera is busy — the same
+# trick Claude Code uses so a long operation feels alive rather than frozen. One
+# is picked at random and swapped for another every few seconds.
+_WHIMSY = [
+    "Thinking", "Pondering", "Noodling", "Cogitating", "Ruminating",
+    "Percolating", "Conjuring", "Tinkering", "Scheming", "Marinating",
+    "Synthesizing", "Untangling", "Wrangling", "Spelunking", "Calibrating",
+    "Finagling", "Whirring", "Computing", "Brewing", "Deliberating",
+    "Puzzling", "Contemplating", "Crunching", "Assembling", "Orchestrating",
+    "Mulling", "Hatching", "Tessellating", "Sleuthing", "Reticulating",
+]
+
+
 class Spinner:
     _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _ROTATE_EVERY = 4.0    # seconds between whimsy-word changes
 
     def __init__(self):
         self._stop = threading.Event()
@@ -448,15 +464,24 @@ class Spinner:
         self._t0   = None
 
     def _run(self, label):
+        # label=None → rotate random whimsy words; an explicit label stays put.
+        whimsy = label is None
+        word = random.choice(_WHIMSY) if whimsy else label
+        last_rot = time.time()
         i = 0
         while not self._stop.is_set():
-            secs = time.time() - self._t0
+            now = time.time()
+            secs = now - self._t0
+            if whimsy and now - last_rot >= self._ROTATE_EVERY:
+                word = random.choice(_WHIMSY)
+                last_rot = now
             f = self._FRAMES[i % len(self._FRAMES)]
-            print(f"\r  {CYAN}{f}{R}  {DIM}{label} {secs:.1f}s{R}   ", end="", flush=True)
+            tail = "…" if whimsy else ""
+            print(f"\r  {CYAN}{f}{R}  {DIM}{word}{tail} {secs:.1f}s{R}   ", end="", flush=True)
             i += 1
             time.sleep(0.1)
 
-    def start(self, label="thinking…"):
+    def start(self, label=None):
         self._t0 = time.time()
         self._stop.clear()
         self._t = threading.Thread(target=self._run, args=(label,), daemon=True)
@@ -1446,6 +1471,7 @@ def undo_last():
 def run_agent(messages, spinner):
     """Drive the reason→act loop until the model produces a final answer."""
     turn_tokens = 0
+    did_work = False   # did this turn actually use tools? (gates next-step tips)
     for step in range(MAX_STEPS):
         spinner.start()
         # Only the streaming call watches for ESC — tool approvals use input()
@@ -1467,6 +1493,10 @@ def run_agent(messages, spinner):
             return True
 
         calls = result["tool_calls"]
+        # Defensive: a turn that emits only tool calls (no streamed content/
+        # reasoning) never trips ensure_header(), so stop the spinner here
+        # before the tool cards and their own spinners print.
+        spinner.stop()
 
         assistant_msg = {"role": "assistant", "content": result["content"] or ""}
         if calls:
@@ -1480,14 +1510,95 @@ def run_agent(messages, spinner):
         if not calls:
             print(f"\n{GREY}{'─' * 50}{R}")
             print(f"{GREY}  {turn_tokens} tok this turn · {SESSION['total']} session{R}\n")
+            if did_work:
+                _suggest_next_steps(messages)
             return True
 
+        did_work = True
         for c in calls:
             output = _exec_call(c)
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": output})
 
     print(f"\n{RED}[stopped] hit MAX_STEPS={MAX_STEPS} tool round-trips{R}\n")
     return True
+
+
+def _parse_suggestions(raw):
+    """Pull a list of next-step strings out of the model's reply (JSON array
+    preferred, bullet/numbered lines as a fallback)."""
+    raw = re.sub(r"(?is)<think>.*?</think>", "", raw or "")
+    raw = re.sub(r"(?is)```(?:json)?", "", raw).strip()
+    m = re.search(r"\[.*\]", raw, re.S)
+    if m:
+        try:
+            arr = json.loads(m.group(0))
+            if isinstance(arr, list):
+                return [str(x).strip().rstrip(".") for x in arr if str(x).strip()]
+        except json.JSONDecodeError:
+            pass
+    out = []
+    for line in raw.splitlines():
+        line = re.sub(r"^[-*\d.)\s]+", "", line.strip()).strip()
+        if line:
+            out.append(line.rstrip("."))
+    return out
+
+
+def _suggest_next_steps(messages):
+    """After a task wraps up, offer a few concrete next steps — like Claude
+    Code's end-of-task suggestions — so the user knows where to go next.
+
+    Best-effort and quiet: only on an interactive TTY, skipped on any error, and
+    disabled entirely with HERA_NO_SUGGESTIONS=1.
+    """
+    if _truthy(_env("HERA_NO_SUGGESTIONS")) or not sys.stdout.isatty():
+        return
+    recent = []
+    for m in messages[-10:]:
+        role = m.get("role")
+        if role == "system":
+            continue
+        c = _text_of(m.get("content"))
+        if m.get("tool_calls"):
+            c += " [ran: " + ", ".join(tc["function"]["name"] for tc in m["tool_calls"]) + "]"
+        if c.strip():
+            recent.append(f"{role}: {c[:600]}")
+    if not recent:
+        return
+    prompt = (
+        "You are a terminal coding assistant that just finished a task. From the session "
+        "transcript below, propose 2-3 concrete, genuinely useful next steps the user could "
+        "take now (e.g. run the tests, review the diff, commit, try an edge case). Each must be "
+        "a short imperative phrase of at most 9 words, specific to what was just done. Reply "
+        "with ONLY a JSON array of strings — no prose, no numbering.\n\n" + "\n".join(recent)
+    )
+    spin = Spinner()
+    spin.start(label="figuring out next steps")
+    try:
+        resp = requests.post(
+            f"{API_URL}/chat/completions",
+            # Disable the model's thinking for this tiny call: otherwise a
+            # reasoning model spends the whole token budget on hidden reasoning
+            # and returns empty content. enable_thinking=false → fast, direct.
+            json={"model": MODEL, "stream": False, "max_tokens": 200,
+                  "chat_template_kwargs": {"enable_thinking": False},
+                  "messages": [{"role": "user", "content": prompt}]},
+            headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"].get("content") or ""
+    except Exception:  # noqa: BLE001 — suggestions are a nicety, never fatal
+        spin.stop()
+        return
+    spin.stop()
+    steps = _parse_suggestions(raw)
+    if not steps:
+        return
+    print(f"{DIM}  Next steps{R}")
+    for s in steps[:3]:
+        print(f"  {ACCENT}›{R} {s}")
+    print()
 
 
 def _normalize_tool_args(raw):
@@ -1546,12 +1657,19 @@ def _exec_call(c, indent=""):
 
     # Snapshot file state before a mutating edit so /undo can revert it.
     snap = _snapshot(args.get("path", "")) if name in ("write_file", "edit_file") else None
+    # Show a live whimsy spinner while the tool runs in the "background" — fast
+    # tools (read_file, list_dir) finish before it's noticeable; slow ones
+    # (run_bash, web_search, web_fetch, task) get visible activity.
+    tspin = Spinner()
+    tspin.start()
     try:
         output = TOOLS[name](**args)
     except TypeError as exc:
         output = f"[error] bad arguments: {exc}"
     except Exception as exc:  # noqa: BLE001 — surface to the model
         output = f"[error] {type(exc).__name__}: {exc}"
+    finally:
+        tspin.stop()
     if snap is not None and not str(output).startswith("[error]"):
         push_checkpoint(args.get("path", ""), snap, name)
     preview = (output.splitlines()[0] if output else "(no output)")[:100]

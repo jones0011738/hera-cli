@@ -128,6 +128,7 @@ Pick `[a]lways` at a `write_file` prompt and Hera creates files on its own for t
 | `/compact` | Summarize the conversation to free up context (also automatic near the limit) |
 | `/tokens` | Show token usage (and `$` cost, if priced) this session |
 | `/plan` | Toggle plan mode — investigate & propose a plan before editing |
+| `/auto` | Auto-approve level for this project: `read` / `edit` / `all` / `off` |
 | `/todos` | Show the current task checklist |
 | `/skills` | List the live shared-skills catalog (`/skills <id>` for detail) |
 | `/tools` | List the tools Hera can use (incl. MCP/custom) |
@@ -215,6 +216,15 @@ target one with `task(agent="<name>", …)`.
 **Custom slash commands:** drop a `~/.config/hera/commands/<name>.md` file and run it as
 `/<name> [args]`; `$ARGUMENTS` in the file is replaced with what you type.
 
+## Auto-approve modes (per project)
+
+`/auto` sets a Claude-Code-style auto-approve level, **remembered per project** and reversible any
+time: `/auto read` (default — read-only tools auto-run, writes/commands prompt), `/auto edit`
+(also auto-approve file writes/edits; shell still prompts), `/auto all` (auto-approve everything),
+and `/auto off` to stop (back to `read`). `/auto` alone shows the current level. A `deny`
+permission rule, **plan mode**, and `PreToolUse` hooks still take precedence even at `all`. Preset
+with `HERA_AUTO_MODE=read|edit|all`.
+
 ## Plan mode, to-dos & cost
 
 For multi-step work Hera keeps a live **to-do checklist** (`todo_write`; ○ → ▸ → ✔, reprint with
@@ -267,6 +277,7 @@ the live catalog the proxy is serving.
 | `HERA_MAX_STEPS` | `25` | Max tool round-trips per message |
 | `HERA_HIDE_REASONING` | `0` | `1` = don't stream the model's thinking |
 | `HERA_PLAN` | `0` | `1` = start in plan mode (propose before editing) |
+| `HERA_AUTO_MODE` | `read` | Auto-approve level: `read` / `edit` / `all` (per-project; `/auto` overrides & persists) |
 | `HERA_NO_SUGGESTIONS` | `0` | `1` = don't print "Next steps" tips after a task |
 | `HERA_PRICE_IN` / `HERA_PRICE_OUT` | `0` | USD per 1M input/output tokens → show `$` cost |
 | `HERA_CONTEXT_TOKENS` / `HERA_AUTO_COMPACT_AT` | `32000` / `0.8` | Auto-compact history near the context window |
@@ -292,11 +303,11 @@ the live catalog the proxy is serving.
 
 ## Updating
 
-Current release: **0.8.2**. On launch Hera checks the published version (at most once a day,
+Current release: **0.8.3**. On launch Hera checks the published version (at most once a day,
 fail-silent) and prints a one-line notice when a newer one is out:
 
 ```
-↑ update available: Hera 0.8.2 (you have 0.6.1)
+↑ update available: Hera 0.8.3 (you have 0.6.1)
   re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
 ```
 

@@ -244,6 +244,7 @@ routed there automatically.
 | `/compact` | Summarize the conversation to free context (also automatic near the limit) |
 | `/tokens` | Token usage (and `$` cost, if priced) this session |
 | `/plan` | Toggle plan mode — investigate & propose before editing |
+| `/auto` | Set auto-approve level for this project: `read` / `edit` / `all` / `off` |
 | `/todos` | Show the current task checklist |
 | `/skills` | List the live shared-skills catalog (`/skills <id>` for detail) |
 | `/tools` | List tools (incl. MCP/custom) |
@@ -261,6 +262,22 @@ Conversations auto-save under `~/.config/hera/sessions/<you>/`. Resume with
 `hera --continue`, `hera --resume <id>`, or `hera --list-sessions`. The store is namespaced by
 the account email your key resolves to (or `HERA_USER` if set, or a hash of the key before any
 email is known), so users never share context on one machine.
+
+### Auto-approve modes (per project)
+
+Tired of approving every step? Set an **auto mode** with `/auto`, just like Claude Code. It is
+**remembered per project** (keyed by the directory you launch in) and you can **stop it any time**:
+
+| `/auto` … | What runs without asking |
+|---|---|
+| `/auto read` *(default)* | Read-only tools only — every write/command still prompts |
+| `/auto edit` | Reads **and** file writes/edits — shell commands still prompt |
+| `/auto all` | **Everything** — full auto for this project |
+| `/auto off` | Stop auto mode (back to `read`) |
+
+`/auto` with no argument shows the current level. Safety always wins over auto mode: a `deny`
+permission rule, **plan mode**, and `PreToolUse` hooks still block or prompt even at `all`. (You
+can also preset it with `HERA_AUTO_MODE=read|edit|all`.)
 
 ### Plan mode, to-dos, and next-step tips
 
@@ -313,6 +330,7 @@ chat is using.
 | `HERA_MAX_STEPS` | `25` | Max tool round-trips per message. |
 | `HERA_HIDE_REASONING` | `0` | `1` = don't stream the model's thinking. |
 | `HERA_PLAN` | `0` | `1` = start in plan mode (propose before editing). |
+| `HERA_AUTO_MODE` | `read` | Auto-approve level: `read` / `edit` / `all` (per-project default; `/auto` overrides & persists). |
 | `HERA_NO_SUGGESTIONS` | `0` | `1` = don't print "Next steps" tips after a task. |
 | `HERA_PRICE_IN` / `HERA_PRICE_OUT` | `0` | USD per 1M input/output tokens → show `$` cost. |
 | `HERA_CONTEXT_TOKENS` / `HERA_AUTO_COMPACT_AT` | `32000` / `0.8` | Auto-compact history near the context window. |
@@ -332,12 +350,12 @@ chat is using.
 
 ## 6. Keeping Hera up to date
 
-The current release is **0.8.2**. On launch Hera checks the published version (at most once a
+The current release is **0.8.3**. On launch Hera checks the published version (at most once a
 day, fail-silent — it never blocks or errors startup). If a newer one is out, you'll see a
 one-line notice like:
 
 ```
-↑ update available: Hera 0.8.2 (you have 0.6.1)
+↑ update available: Hera 0.8.3 (you have 0.6.1)
   re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
 ```
 
@@ -349,7 +367,7 @@ $ hera doctor
 
 ▌ Hera doctor  · update + health check
 
-  ✓ update       updated v0.6.1 → v0.8.2  ·  ~/.local/bin/hera
+  ✓ update       updated v0.6.1 → v0.8.3  ·  ~/.local/bin/hera
   ✓ endpoint     http://<HOST>:8090/v1
   ✓ api key      set
   ✓ model        qwen3.6-35b-a3b — HTTP 200

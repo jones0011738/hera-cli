@@ -14,7 +14,12 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.2`.
+- **Version:** `0.8.3`.
+- **Per-project auto-approve modes** — `AUTO_MODE` ∈ {`read`,`edit`,`all`} (Claude-Code-style),
+  saved under `config["auto_modes"][<project path>]`. `/auto read|edit|all|off`, `HERA_AUTO_MODE`,
+  serve `{"type":"auto"}`, and a VS Code **Auto** dropdown. Wired into `approve()` **and**
+  `_serve_approve()` (the serve gate now also runs plan-mode / permissions / PreToolUse hooks, which
+  it previously skipped). Deny rules, plan mode, and hooks still override `all`.
 - **`hera doctor`** — `_self_update()` re-downloads `hera.py` over the running file from the
   configured `download_url` (atomic, version-guarded, `--force` to re-pull), then prints a health
   check. The one-word self-updater.
@@ -22,7 +27,7 @@ aiming for Claude-Code-class behavior.
   (`_is_context_overflow`), `compact_history()`, and retry once; `_maybe_auto_compact` also fires on
   the server's real last prompt-token count (`_LAST_PROMPT_TOKENS`). No more raw
   `400 … exceeds the available context size`.
-- **Claude-Code parity pass (0.7.0 → 0.8.2):**
+- **Claude-Code parity pass (0.7.0 → 0.8.3):**
   - **To-do tracking** — `todo_write` tool maintains a live checklist (CLI render + `todos`
     serve event → "Plan" block in VS Code). The system prompt nudges it for multi-step tasks.
   - **End-of-task next-step tips** — `_generate_suggestions` (called with `enable_thinking:false`)

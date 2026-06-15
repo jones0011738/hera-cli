@@ -152,7 +152,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.2"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.3"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -218,6 +218,40 @@ _PERMS = _FILE_CFG.get("permissions") if isinstance(_FILE_CFG.get("permissions")
 # Plan mode: read-only investigation; mutating tools are blocked until the user
 # approves the plan (toggle with /plan, or a {"type":"plan"} message in --serve).
 PLAN_MODE = _truthy(_env("HERA_PLAN"))
+
+# Auto mode (Claude-Code-style permission modes), remembered PER PROJECT:
+#   read  — only read-only tools auto-run; writes/commands still prompt   [default]
+#   edit  — also auto-approve file writes/edits (shell commands still prompt)
+#   all   — auto-approve every tool (deny rules, plan mode and hooks still win)
+# Set with /auto (or HERA_AUTO_MODE / a {"type":"auto"} serve message); stop any
+# time with /auto off (→ read). Saved under config["auto_modes"][<project path>].
+_AUTO_LEVELS = ("read", "edit", "all")
+_EDIT_TOOLS = {"write_file", "edit_file"}
+
+
+def _project_key():
+    return os.path.abspath(os.getcwd())
+
+
+def _load_auto_mode():
+    env = _env("HERA_AUTO_MODE").lower()
+    if env in _AUTO_LEVELS:
+        return env
+    modes = _FILE_CFG.get("auto_modes")
+    if isinstance(modes, dict) and modes.get(_project_key()) in _AUTO_LEVELS:
+        return modes[_project_key()]
+    return "read"
+
+
+def _save_auto_mode(mode):
+    modes = _FILE_CFG.get("auto_modes")
+    if not isinstance(modes, dict):
+        modes = {}
+    modes[_project_key()] = mode
+    save_config({"auto_modes": modes})
+
+
+AUTO_MODE = _load_auto_mode()
 
 # In-task to-do list (Claude-Code-style). Items: {"content": str, "status": ...}.
 TODOS = []
@@ -1231,9 +1265,14 @@ def approve(name, args):
     if decision == "allow":
         return True
 
-    # A 'ask' rule forces a prompt even for read-only tools / under YOLO.
-    if decision != "ask" and (YOLO or name not in SIDE_EFFECTS or name in _always_ok):
-        return True
+    # Auto mode (per-project) and a 'ask' rule both modulate the prompt.
+    if decision != "ask":
+        if YOLO or AUTO_MODE == "all":
+            return True
+        if AUTO_MODE == "edit" and name in _EDIT_TOOLS:
+            return True
+        if name not in SIDE_EFFECTS or name in _always_ok:
+            return True
 
     # run_bash: consult the command allowlist first.
     if name == "run_bash":
@@ -2926,8 +2965,13 @@ def print_banner():
     print(rule)
     row("server", host)
     row("cwd", _short(os.getcwd()))
-    row("safety", "auto-approve (YOLO)" if YOLO else "approval on edits & bash",
-        RED if YOLO else "")
+    if YOLO:
+        row("safety", "auto-approve (YOLO)", RED)
+    elif AUTO_MODE != "read":
+        desc = {"edit": "auto-approve reads + edits", "all": "auto-approve ALL (/auto off to stop)"}
+        row("safety", f"auto: {AUTO_MODE} — {desc[AUTO_MODE]}", YELL)
+    else:
+        row("safety", "approval on edits & bash  (/auto for auto mode)")
     row("sandbox", sandbox_label())
     if ALLOW_PATTERNS:
         row("allow", f"{len(ALLOW_PATTERNS)} pattern(s)")
@@ -2953,6 +2997,7 @@ SLASH_COMMANDS = [
     ("/compact",   "",          "summarize the conversation to free up context"),
     ("/tokens",    "",          "show token usage (and cost, if priced) this session"),
     ("/plan",      "",          "toggle plan mode (investigate & propose before editing)"),
+    ("/auto",      "[mode]",    "auto-approve level for this project: read / edit / all / off"),
     ("/todos",     "",          "show the current to-do checklist"),
     ("/tools",     "",          "list the tools I can use"),
     ("/allow",     "[pattern]", "list run_bash allow patterns, or add one"),
@@ -3353,6 +3398,15 @@ def _serve_input_thread():
             global PLAN_MODE
             PLAN_MODE = bool(msg.get("on", not PLAN_MODE))
             _emit({"type": "info", "text": f"plan mode {'on' if PLAN_MODE else 'off'}"})
+        elif t == "auto":
+            global AUTO_MODE
+            want = str(msg.get("mode", "read")).lower()
+            want = {"off": "read", "write": "edit"}.get(want, want)
+            if want in _AUTO_LEVELS:
+                AUTO_MODE = want
+                _save_auto_mode(want)
+                _emit({"type": "info", "text": f"auto mode → {want}"})
+                _emit({"type": "auto_mode", "mode": want})
         else:
             _MAIN_Q.put(msg)
 
@@ -3439,9 +3493,27 @@ def _serve_stream(messages):
 
 
 def _serve_approve(name, args):
-    if YOLO or name not in SIDE_EFFECTS or name in _always_ok:
+    # Same gating as the interactive approve(): plan mode, config permissions,
+    # PreToolUse hooks, then auto mode / YOLO / allowlist — before prompting.
+    if PLAN_MODE and name in SIDE_EFFECTS:
+        return ("plan mode is on — outline the plan and stop. Modifying tools stay disabled "
+                "until the user approves (they exit plan mode with /plan).")
+    decision = _perm_decision(name, args)
+    if decision == "deny":
+        return "denied by a permission rule"
+    blocked = _run_hooks("PreToolUse", name, args)
+    if blocked:
+        return blocked
+    if decision == "allow":
         return True
-    if name == "run_bash" and bash_allowed(args.get("command", "")):
+    if decision != "ask":
+        if YOLO or AUTO_MODE == "all":
+            return True
+        if AUTO_MODE == "edit" and name in _EDIT_TOOLS:
+            return True
+        if name not in SIDE_EFFECTS or name in _always_ok:
+            return True
+    if name == "run_bash" and decision != "ask" and bash_allowed(args.get("command", "")):
         return True
     _emit({"type": "approval_request", "name": name,
            "preview": _strip_ansi(_preview_call(name, args)),
@@ -3600,7 +3672,7 @@ def serve_main():
     messages = [{"role": "system", "content": system_prompt()}]
     threading.Thread(target=_serve_input_thread, daemon=True).start()
     _emit({"type": "ready", "name": NAME, "model": MODEL, "cwd": os.getcwd(),
-           "sandbox": sandbox_label(), "tools": list(TOOLS),
+           "sandbox": sandbox_label(), "tools": list(TOOLS), "auto_mode": AUTO_MODE,
            "vision": bool(VISION_URL), "needs_key": not bool(API_KEY)})
     while True:
         msg = _MAIN_Q.get()
@@ -4000,6 +4072,27 @@ def _repl(messages, spinner):
                 print("\n" + _render_todos_text() + "\n")
             else:
                 print(f"\n{DIM}no to-do list yet.{R}\n")
+            continue
+        if cmd == "/auto" or cmd.startswith("/auto "):
+            arg = user_input[5:].strip().lower()
+            alias = {"off": "read", "none": "read", "write": "edit", "edits": "edit",
+                     "readwrite": "edit", "read+write": "edit", "everything": "all", "yolo": "all"}
+            mode = alias.get(arg, arg)
+            if mode in _AUTO_LEVELS:
+                globals()["AUTO_MODE"] = mode
+                _save_auto_mode(mode)
+                blurb = {"read": "auto-approve reads only — writes/commands will prompt",
+                         "edit": "auto-approve reads + file edits — shell commands still prompt",
+                         "all":  "auto-approve ALL tools (deny rules & plan mode still apply)"}[mode]
+                print(f"\n{DIM}auto mode → {BOLD}{mode}{R}{DIM} for this project ({_project_key()}).\n"
+                      f"  {blurb}.  Stop any time with {R}{CYAN}/auto off{R}{DIM}.{R}\n")
+            elif not arg:
+                print(f"\n{DIM}auto mode is {BOLD}{AUTO_MODE}{R}{DIM} for this project.\n"
+                      f"  {R}{CYAN}/auto read{R}{DIM} (reads only) · {R}{CYAN}/auto edit{R}{DIM} "
+                      f"(+ file edits) · {R}{CYAN}/auto all{R}{DIM} (everything) · "
+                      f"{R}{CYAN}/auto off{R}{DIM} (stop).{R}\n")
+            else:
+                print(f"\n{DIM}unknown auto mode {arg!r}. Use read / edit / all / off.{R}\n")
             continue
 
         # User-defined slash commands from ~/.config/hera/commands/*.md.

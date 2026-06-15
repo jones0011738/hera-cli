@@ -303,12 +303,24 @@ can also preset it with `HERA_AUTO_MODE=read|edit|all`.)
 
 ### Verify-your-work loop
 
-Like Claude Code / Codex, Hera **runs the code it writes**. After editing a code file it verifies the
-change actually works — runs the project's tests/build/linter, or executes the affected file — and if
-it fails, it reads the error, fixes the cause, and re-runs, repeating until it passes or it's blocked.
-It also does this when you ask it to *"run this project"*: it gets it running and fixes what breaks.
-Those verification commands and fixes go through the **normal approval prompts** (or run unattended
-under `/auto`). Disable with `HERA_NO_VERIFY=1`.
+Like Claude Code / Codex, Hera **runs the code it writes** — and the code it didn't. After editing a
+code file (or when you ask it to *"run this project"* / *"run the tests"* / *"make sure it works"*),
+it verifies the thing actually works, and if it fails it reads the error, fixes the cause, and
+re-runs, repeating until it passes or it's blocked.
+
+It **detects the project's toolchain** and prefers the right command:
+
+| It sees… | It runs… |
+|---|---|
+| `pyproject.toml` / `setup.py` / `tests/` | `pytest` |
+| `package.json` scripts | `npm test` / `npm run build` / `npm run lint` |
+| `go.mod` | `go build ./...` · `go test ./...` |
+| `Cargo.toml` | `cargo build` · `cargo test` |
+| `Makefile` (test/build target) | `make test` (or that target) |
+| `pom.xml` / `build.gradle` / `manage.py` / … | the matching build/test command |
+
+Verification commands and fixes go through the **normal approval prompts** (or run unattended under
+`/auto`). Disable with `HERA_NO_VERIFY=1`.
 
 ### Plan mode, to-dos, and next-step tips
 
@@ -397,12 +409,12 @@ chat is using.
 
 ## 6. Keeping Hera up to date
 
-The current release is **0.8.8**. On launch Hera checks the published version (at most once a
+The current release is **0.8.9**. On launch Hera checks the published version (at most once a
 day, fail-silent — it never blocks or errors startup). If a newer one is out, you'll see a
 one-line notice like:
 
 ```
-↑ update available: Hera 0.8.8 (you have 0.6.1)
+↑ update available: Hera 0.8.9 (you have 0.6.1)
   re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
 ```
 
@@ -414,7 +426,7 @@ $ hera doctor
 
 ▌ Hera doctor  · update + health check
 
-  ✓ update       updated v0.6.1 → v0.8.8  ·  ~/.local/bin/hera
+  ✓ update       updated v0.6.1 → v0.8.9  ·  ~/.local/bin/hera
   ✓ endpoint     http://<HOST>:8090/v1
   ✓ api key      set
   ✓ model        qwen3.6-35b-a3b — HTTP 200

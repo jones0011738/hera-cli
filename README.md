@@ -235,11 +235,13 @@ with `HERA_AUTO_MODE=read|edit|all`.
 
 ## Verify-your-work loop
 
-Like Claude Code / Codex, Hera **runs the code it writes**: after editing a code file it verifies the
-change (runs the tests/build, or executes the affected file), and if it fails it reads the error,
-fixes the cause, and re-runs — repeating until it passes or it's blocked. It does the same when you
-ask it to *run a project*. Verification commands and fixes use the normal approval prompts (or run
-unattended under `/auto`). Disable with `HERA_NO_VERIFY=1`.
+Like Claude Code / Codex, Hera **runs the code it writes — and the code it didn't**: after editing a
+code file, or when you ask it to *run a project* / *run the tests* / *make sure it works*, it verifies
+the thing actually runs and fixes what breaks (read error → fix → re-run, until it passes or it's
+blocked). It **detects the toolchain** and prefers the right command — `pytest` (pyproject/tests),
+`npm test`/`run build` (package.json), `go build ./...`/`go test ./...` (go.mod), `cargo` (Cargo.toml),
+`make <target>` (Makefile), Maven/Gradle/Django, etc. Verification and fixes use the normal approval
+prompts (or run unattended under `/auto`). Disable with `HERA_NO_VERIFY=1`.
 
 ## Plan mode, to-dos & cost
 
@@ -325,11 +327,11 @@ the live catalog the proxy is serving.
 
 ## Updating
 
-Current release: **0.8.8**. On launch Hera checks the published version (at most once a day,
+Current release: **0.8.9**. On launch Hera checks the published version (at most once a day,
 fail-silent) and prints a one-line notice when a newer one is out:
 
 ```
-↑ update available: Hera 0.8.8 (you have 0.6.1)
+↑ update available: Hera 0.8.9 (you have 0.6.1)
   re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
 ```
 

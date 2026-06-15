@@ -153,7 +153,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.8"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.9"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -272,6 +272,105 @@ _VERIFY_NUDGE = (
 
 def _is_code_file(path):
     return str(path or "").lower().endswith(_CODE_EXTS)
+
+
+def _detect_project_commands(cwd=None):
+    """Inspect the working dir for build/test markers and return the preferred
+    verification commands (pytest / package.json scripts / Makefile target /
+    go.mod / Cargo / etc.), so verification targets the real toolchain."""
+    cwd = cwd or os.getcwd()
+    def has(*names):
+        return any(os.path.exists(os.path.join(cwd, n)) for n in names)
+    cmds = []
+    # Python
+    if has("pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "pytest.ini") or \
+            os.path.isdir(os.path.join(cwd, "tests")):
+        cmds.append("pytest -q")
+    if has("manage.py"):
+        cmds.append("python manage.py check")
+    # Node / JS
+    if has("package.json"):
+        try:
+            scripts = (json.load(open(os.path.join(cwd, "package.json"),
+                                       encoding="utf-8")) or {}).get("scripts", {}) or {}
+        except Exception:  # noqa: BLE001
+            scripts = {}
+        if "test" in scripts:
+            cmds.append("npm test")
+        if "build" in scripts:
+            cmds.append("npm run build")
+        if "lint" in scripts:
+            cmds.append("npm run lint")
+        if not scripts:
+            cmds.append("npm install && npm start")
+    # Go / Rust
+    if has("go.mod"):
+        cmds += ["go build ./...", "go test ./..."]
+    if has("Cargo.toml"):
+        cmds += ["cargo build", "cargo test"]
+    # Make — prefer a test/check/build target if one exists
+    if has("Makefile", "makefile"):
+        mk = ""
+        for n in ("Makefile", "makefile"):
+            p = os.path.join(cwd, n)
+            if os.path.isfile(p):
+                try:
+                    mk = open(p, encoding="utf-8", errors="replace").read()
+                except OSError:
+                    mk = ""
+                break
+        targets = set(re.findall(r"(?m)^([A-Za-z0-9_.-]+):", mk))
+        cmds.append(next((f"make {t}" for t in ("test", "check", "build", "all")
+                          if t in targets), "make"))
+    # JVM / others
+    if has("pom.xml"):
+        cmds.append("mvn -q -DskipTests package")
+    if has("build.gradle", "build.gradle.kts"):
+        cmds.append("./gradlew build")
+    if has("Gemfile"):
+        cmds.append("bundle exec rake")
+    if has("CMakeLists.txt"):
+        cmds.append("cmake -S . -B build && cmake --build build")
+    if has("composer.json"):
+        cmds.append("composer test")
+    if has("docker-compose.yml", "docker-compose.yaml", "compose.yaml"):
+        cmds.append("docker compose config")  # validate (full `up` is heavy)
+    seen, out = set(), []
+    for c in cmds:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out[:4]
+
+
+def _project_hint():
+    cmds = _detect_project_commands()
+    return (" This project's toolchain looks like: " + ", ".join(f"`{c}`" for c in cmds)
+            + " — prefer those to verify.") if cmds else ""
+
+
+def _verify_nudge():
+    return _VERIFY_NUDGE + _project_hint()
+
+
+# Phrases that mean "run / test / verify this (existing) project" — so Hera
+# verifies a codebase it didn't write when you ask it to, like Claude Code.
+_RUN_VERIFY_RE = re.compile(
+    r"\b("
+    r"run (it|this|the (project|code|app|tests?|server|system|build|suite|file|script)|my )|"
+    r"make sure (it|this|the \w+) (runs?|works?|builds?|passes?|compiles?)|"
+    r"(get|make) (it|this|the \w+) (run|running|work|working|build|building|pass|passing)|"
+    r"does (it|this|the \w+) (run|build|work|compile|pass)|"
+    r"verify (it|that|this|the )|"
+    r"check (that |if )?(it|the \w+) (runs?|works?|builds?|compiles?)|"
+    r"run the tests?|test (it|the (project|code|system|app|build))|"
+    r"build (it|the (project|app|code))|is (it|the \w+) working|"
+    r"see if (it|the \w+) (runs?|works?|builds?)"
+    r")\b", re.IGNORECASE)
+
+
+def _wants_run_verification(text):
+    return bool(_RUN_VERIFY_RE.search(text or ""))
 
 
 # In-task to-do list (Claude-Code-style). Items: {"content": str, "status": ...}.
@@ -1639,6 +1738,11 @@ def run_agent(messages, spinner):
     edited_code = False  # wrote/edited a code file
     ran_command = False  # ran a shell command (≈ self-verified)
     verified = False     # already injected the auto-verify nudge for this task
+    # Did the user ask to run/verify an (existing) project? Then verify even
+    # without edits — like "run this", "make sure it works", "run the tests".
+    verify_requested = _wants_run_verification(
+        next((_text_of(m.get("content")) for m in reversed(messages)
+              if m.get("role") == "user"), ""))
     _maybe_auto_compact(messages)
     for step in range(MAX_STEPS):
         spinner.start()
@@ -1676,14 +1780,15 @@ def run_agent(messages, spinner):
         messages.append(assistant_msg)
 
         if not calls:
-            # Verify-your-work loop: if code was written but never run, nudge once
-            # to test it (and fix failures) before declaring the task done.
-            if (AUTO_VERIFY and edited_code and not ran_command and not verified
-                    and not PLAN_MODE):
+            # Verify-your-work loop: if code was written (or the user asked to run
+            # the project) but nothing was run, nudge once to actually run it and
+            # fix failures before declaring the task done.
+            if (AUTO_VERIFY and (edited_code or verify_requested) and not ran_command
+                    and not verified and not PLAN_MODE):
                 verified = True
                 edited_code = False
-                messages.append({"role": "user", "content": _VERIFY_NUDGE})
-                print(f"\n{DIM}  ⟳ auto-verify: making sure the changes actually run "
+                messages.append({"role": "user", "content": _verify_nudge()})
+                print(f"\n{DIM}  ⟳ auto-verify: making sure it actually runs "
                       f"(ESC to skip)…{R}")
                 continue
             print(f"\n{GREY}{'─' * 50}{R}")
@@ -2967,6 +3072,7 @@ def system_prompt():
                  "root cause, and re-run; repeat until it passes or you're genuinely blocked (then "
                  "explain what's blocking). When asked to run a project or codebase, get it actually "
                  "running and fix what breaks. Prefer the smallest relevant check.")
+        base += _project_hint()
     if PLAN_MODE:
         base += (" PLAN MODE IS ON. Investigate with read-only tools only — do NOT modify files, "
                  "run state-changing commands, or install anything yet. When you have a concrete "
@@ -3827,6 +3933,9 @@ def _serve_run(messages):
     turn = 0
     did_work = False
     edited_code = ran_command = verified = False
+    verify_requested = _wants_run_verification(
+        next((_text_of(m.get("content")) for m in reversed(messages)
+              if m.get("role") == "user"), ""))
     _maybe_auto_compact(messages, emit=_emit)
     for _ in range(MAX_STEPS):
         res = _serve_stream(messages)
@@ -3850,13 +3959,14 @@ def _serve_run(messages):
         messages.append(am)
         if not calls:
             # Verify-your-work loop (before turn_end, so the panel stays busy
-            # through the check): code changed but nothing ran → nudge once.
-            if (AUTO_VERIFY and edited_code and not ran_command and not verified
-                    and not PLAN_MODE):
+            # through the check): code changed (or the user asked to run the
+            # project) but nothing ran → nudge once.
+            if (AUTO_VERIFY and (edited_code or verify_requested) and not ran_command
+                    and not verified and not PLAN_MODE):
                 verified = True
                 edited_code = False
-                messages.append({"role": "user", "content": _VERIFY_NUDGE})
-                _emit({"type": "info", "text": "auto-verify: running the changes to make sure they work…"})
+                messages.append({"role": "user", "content": _verify_nudge()})
+                _emit({"type": "info", "text": "auto-verify: running it to make sure it works…"})
                 continue
             _emit({"type": "turn_end", "content": res["content"] or "",
                    "turn_tokens": turn, "session_tokens": dict(SESSION),

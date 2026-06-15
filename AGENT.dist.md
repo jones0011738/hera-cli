@@ -14,22 +14,40 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.0`.
-- **Shared skills:** the CLI now has `/skills` and `/skills <id>`, backed by the proxy's
-  authenticated `GET /skills` endpoint. Shared prompt/workflow skills live upstream in
-  `shared-skills/skills/*.md`, can trigger automatically or via `@skill:<id>` / `/skill <id>`,
-  and are shared across the CLI, VS Code extension, and Open WebUI web chat.
-- **Fast current-time path:** upstream added a remote `world-time` skill served from
-  `GET /skill-api/world-time?q=...` on the proxy. That keeps exact time/date/day prompts out of
-  flaky web-search retrieval and returns concrete live time data instead.
+- **Version:** `0.8.1`.
+- **Claude-Code parity pass (0.7.0 → 0.8.1):**
+  - **To-do tracking** — `todo_write` tool maintains a live checklist (CLI render + `todos`
+    serve event → "Plan" block in VS Code). The system prompt nudges it for multi-step tasks.
+  - **End-of-task next-step tips** — `_generate_suggestions` (called with `enable_thinking:false`)
+    prints 2–3 next steps in the CLI and emits a `suggestions` event (clickable chips in VS Code).
+  - **Plan mode** — `/plan`, `HERA_PLAN`, or serve `{"type":"plan"}`; blocks mutating tools even
+    under YOLO until the user approves.
+  - **Hooks** — `config.json` `hooks` (PreToolUse/PostToolUse/Stop); PreToolUse vetoes on non-zero.
+  - **Fine-grained permissions** — `config.json` `permissions` (`allow`/`ask`/`deny`, e.g.
+    `run_bash(git *)`, `edit_file(src/**)`); `deny`/`ask` override YOLO.
+  - **Auto-compaction** — summarizes history near the context window
+    (`HERA_CONTEXT_TOKENS`/`HERA_AUTO_COMPACT_AT`).
+  - **Cost** — `HERA_PRICE_IN/OUT` → estimated `$` in turn/session summaries, `/tokens`, serve
+    `turn_end`.
+  - **Custom slash commands** — `~/.config/hera/commands/*.md` (`$ARGUMENTS`).
+  - **Named sub-agents** — `~/.config/hera/agents/*.md` (optional `tools:` frontmatter), via the
+    `task` tool's `agent` field.
+  - **Background shell** — `run_bash(run_in_background=true)` + `bash_output`/`bash_kill`.
+  - **MCP over HTTP/SSE** — `McpHttpClient` (Streamable HTTP) alongside the stdio client; `mcp.json`
+    `url` entries with `token`/`headers` (bearer/OAuth token, `${ENV}` expansion).
+- **Shared skills:** `/skills` and `/skills <id>`, backed by the proxy's authenticated
+  `GET /skills` endpoint; skills live in `shared-skills/skills/*.md` and are shared across the CLI,
+  VS Code extension, and Open WebUI web chat.
+- **Fast current-time path:** remote `world-time` skill (`GET /skill-api/world-time?q=...`).
 
 ## Architecture (all in `hera.py`)
 - **Config** — `HERA_*` env (`_env`/`_truthy`). `API_URL`/`API_KEY` have no defaults.
 - **Tools** — `TOOLS` dict + `TOOL_SCHEMAS` (OpenAI function schemas): `list_dir`, `read_file`,
   `glob`, `search`, `symbols` (AST/regex code index), `semantic_search` (embeddings; registered
   only if an embeddings endpoint responds), `web_search`/`web_fetch` (keyless DuckDuckGo; on
-  unless `HERA_NO_WEB=1`), `write_file`, `edit_file`, `run_bash`, `install_tool` (on unless
-  `HERA_NO_AUTOINSTALL=1`), `task`.
+  unless `HERA_NO_WEB=1`), `write_file`, `edit_file`, `run_bash` (+ `run_in_background`),
+  `bash_output`/`bash_kill`, `todo_write`, `install_tool` (on unless `HERA_NO_AUTOINSTALL=1`),
+  `task` (optional named `agent`).
 - **Web access** — `web_search`/`web_fetch` use `requests` directly (NOT the sandbox), so they
   reach the network even though `run_bash` is network-isolated. Read-only → no approval gate.
 - **Installing tools** — proactive `install_tool` (in `SIDE_EFFECTS`, user approves) and reactive
@@ -38,7 +56,9 @@ aiming for Claude-Code-class behavior.
   Consent is pluggable via `_INSTALL_APPROVER` (terminal `input()` in the REPL; an IDE
   `approval_request` event in `--serve`).
 - **Approval gate** — `approve()` + `bash_allowed()`; `SIDE_EFFECTS` need approval; allowlist
-  (`HERA_ALLOW`/`.heraallow`/`/allow`) + built-in denylist.
+  (`HERA_ALLOW`/`.heraallow`/`/allow`) + built-in denylist. Layered on top: **plan mode** (blocks
+  mutating tools), **config `permissions`** (`_perm_decision`: allow/ask/deny), and **PreToolUse
+  hooks** (`_run_hooks` can veto) — all consulted before the YOLO/allowlist short-circuit.
 - **Prompt UI** — raw-mode line editor (`RawLineReader`, stdlib `termios`/`tty`) with a live
   `/`-command dropdown (filter, `↑`/`↓`, `Tab`/`Enter`); falls back to `input()` when not a TTY.
   `SLASH_COMMANDS` is the single source of truth for the menu, `/help`, `/resume`, and `/skills`.
@@ -51,10 +71,15 @@ aiming for Claude-Code-class behavior.
 - **Sessions** — saved per user under `~/.config/hera/sessions/<HERA_USER or key-hash>/`;
   `--resume`/`--continue`/`--list-sessions`, `/sessions`, `/resume` (interactive picker → `_switch_to`), `/new`.
 - **Checkpoints** — every write/edit snapshots prior state; `/undo` reverts (`CHECKPOINTS`).
-- **Extensions** — MCP stdio client (`McpClient`, `~/.config/hera/mcp.json`) and custom tools
-  (`~/.config/hera/tools.py`, a `HERA_TOOLS` list). `register_extensions()`.
+- **Extensions** — MCP stdio client (`McpClient`) **and HTTP/SSE client (`McpHttpClient`,
+  Streamable HTTP, bearer/OAuth token)** from `~/.config/hera/mcp.json` (an entry with `command`
+  is stdio; with `url` is HTTP), plus custom tools (`~/.config/hera/tools.py`, a `HERA_TOOLS`
+  list). `register_extensions()`.
+- **Custom commands / agents** — `~/.config/hera/commands/*.md` (slash commands, `$ARGUMENTS`) and
+  `~/.config/hera/agents/*.md` (named sub-agents) loaded via `_load_markdown_dir`.
 - **Headless mode** — `--serve`: newline-delimited JSON on stdin/stdout (`ready`/`reasoning`/
-  `token`/`tool_start`/`approval_request`/`tool_end`/`turn_end`), used by the VS Code extension.
+  `token`/`tool_start`/`approval_request`/`tool_end`/`turn_end`/`todos`/`suggestions`), used by
+  the VS Code extension. Inputs include `{"type":"plan"}` to toggle plan mode.
   **stdout stays JSON-only — tool functions must `print()` progress to `sys.stderr`**, never
   stdout, or they corrupt the protocol. The reactive install offer surfaces as an
   `approval_request` here via `_serve_install_approver` (set on `_INSTALL_APPROVER`).

@@ -152,7 +152,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.0"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.1"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -2466,6 +2466,110 @@ class McpClient:
             pass
 
 
+def _expand_env_vars(s):
+    """Expand ${VAR} from the environment so secrets stay out of mcp.json."""
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
+                  lambda m: os.environ.get(m.group(1), ""), str(s))
+
+
+def _mcp_headers(spec):
+    """Build request headers for an HTTP MCP server, including bearer auth.
+
+    `token`/`auth_token` becomes `Authorization: Bearer …` — this is the
+    credential an OAuth flow ultimately yields (a personal access / API token).
+    `headers` lets you set anything else. Both support ${ENV} expansion.
+    """
+    headers = {k: _expand_env_vars(v) for k, v in (spec.get("headers") or {}).items()}
+    token = spec.get("token") or spec.get("auth_token")
+    if token and "Authorization" not in headers:
+        headers["Authorization"] = "Bearer " + _expand_env_vars(token)
+    return headers
+
+
+class McpHttpClient:
+    """MCP client over Streamable HTTP — JSON-RPC POSTed to one endpoint, with
+    either an application/json reply or a text/event-stream (SSE) reply. Works
+    with remote MCP servers that authenticate via a bearer/OAuth token."""
+
+    def __init__(self, name, url, headers=None, timeout=30):
+        self.name = name
+        self.url = url
+        self.timeout = timeout
+        self.session_id = None
+        self._id = 0
+        self.tools = []
+        self.headers = {"Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream"}
+        self.headers.update(headers or {})
+        self._handshake()
+
+    def _post(self, payload, timeout=None):
+        h = dict(self.headers)
+        if self.session_id:
+            h["Mcp-Session-Id"] = self.session_id
+        resp = requests.post(self.url, json=payload, headers=h,
+                             timeout=timeout or self.timeout, stream=True)
+        resp.raise_for_status()
+        sid = resp.headers.get("Mcp-Session-Id")
+        if sid:
+            self.session_id = sid
+        if "text/event-stream" in resp.headers.get("Content-Type", ""):
+            for raw in resp.iter_lines(decode_unicode=True):
+                if raw and raw.startswith("data:"):
+                    data = raw[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        msg = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(msg, dict) and ("result" in msg or "error" in msg):
+                        return msg
+            return None
+        text = (resp.text or "").strip()
+        return json.loads(text) if text else None
+
+    def _rpc(self, method, params=None, timeout=None):
+        self._id += 1
+        msg = self._post({"jsonrpc": "2.0", "id": self._id, "method": method,
+                          "params": params or {}}, timeout)
+        if msg is None:
+            raise RuntimeError(f"MCP '{self.name}' returned no response to {method}")
+        if "error" in msg:
+            raise RuntimeError(msg["error"].get("message", "MCP error"))
+        return msg.get("result", {})
+
+    def _notify(self, method, params=None):
+        try:
+            self._post({"jsonrpc": "2.0", "method": method, "params": params or {}})
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _handshake(self):
+        self._rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                 "clientInfo": {"name": "hera", "version": "1"}})
+        self._notify("notifications/initialized")
+        self.tools = self._rpc("tools/list").get("tools", [])
+
+    def call(self, tool, arguments):
+        res = self._rpc("tools/call", {"name": tool, "arguments": arguments or {}})
+        parts = []
+        for c in res.get("content", []):
+            parts.append(c.get("text", "") if c.get("type") == "text" else json.dumps(c))
+        text = "\n".join(p for p in parts if p) or "(no output)"
+        return ("[mcp error] " + text) if res.get("isError") else text
+
+    def close(self):
+        if not self.session_id:
+            return
+        try:  # politely end the server session if it tracks one
+            requests.delete(self.url, headers={"Mcp-Session-Id": self.session_id,
+                            **{k: v for k, v in self.headers.items() if k == "Authorization"}},
+                            timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _register_tool(name, description, parameters, func, read_only=False):
     TOOLS[name] = func
     TOOL_SCHEMAS.append({"type": "function", "function": {
@@ -2489,10 +2593,16 @@ def register_mcp():
     servers = cfg.get("mcpServers", cfg if isinstance(cfg, dict) else {})
     loaded = []
     for sname, spec in servers.items():
-        if not isinstance(spec, dict) or "command" not in spec:
+        if not isinstance(spec, dict):
             continue
         try:
-            client = McpClient(sname, spec["command"], spec.get("args"), spec.get("env"))
+            if spec.get("url"):                       # remote HTTP/SSE MCP server
+                client = McpHttpClient(sname, _expand_env_vars(spec["url"]),
+                                       _mcp_headers(spec), int(spec.get("timeout", 30)))
+            elif spec.get("command"):                 # local stdio MCP server
+                client = McpClient(sname, spec["command"], spec.get("args"), spec.get("env"))
+            else:
+                continue
         except Exception as exc:  # noqa: BLE001
             print(f"{YELL}[mcp] failed to start '{sname}': {exc}{R}", file=sys.stderr)
             continue

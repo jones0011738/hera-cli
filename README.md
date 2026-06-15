@@ -104,11 +104,13 @@ that edits files or runs a command (`[y]es / [a]lways / [n]o`). Read-only tools 
 | `semantic_search` | Embedding-ranked code search (only if an embeddings endpoint is reachable) | auto |
 | `write_file` | Create / overwrite a file | prompts |
 | `edit_file` | Exact string replacement in a file | prompts |
-| `run_bash` | Run a shell command (offers to install a missing program, then retries) | prompts |
+| `run_bash` | Run a shell command (offers to install a missing program, then retries; `run_in_background` for servers/watchers) | prompts |
+| `bash_output` / `bash_kill` | Read or stop a background `run_bash` job | auto / prompts |
+| `todo_write` | Maintain the on-screen task checklist | auto |
 | `web_search` | Search the live web when Hera lacks info (auto-triggered) | auto |
 | `web_fetch` | Fetch a page's readable text (e.g. a docs URL) | auto |
 | `install_tool` | Download & install a program Hera decides it needs | prompts |
-| `task` | Delegate a subtask to a focused sub-agent (own tool loop) | runs (inner calls prompt) |
+| `task` | Delegate a subtask to a focused sub-agent (optional named `agent`) | runs (inner calls prompt) |
 
 Web tools let Hera look things up on its own when it's missing information; disable with
 `HERA_NO_WEB=1`. Hera can also pull in tools it needs: it calls **`install_tool`** (you approve
@@ -123,8 +125,10 @@ Pick `[a]lways` at a `write_file` prompt and Hera creates files on its own for t
 |---|---|
 | `/undo` | Revert the last file write/edit (repeatable) |
 | `/diff` | Show the working-tree `git diff` |
-| `/compact` | Summarize the conversation to free up context |
-| `/tokens` | Show token usage this session |
+| `/compact` | Summarize the conversation to free up context (also automatic near the limit) |
+| `/tokens` | Show token usage (and `$` cost, if priced) this session |
+| `/plan` | Toggle plan mode — investigate & propose a plan before editing |
+| `/todos` | Show the current task checklist |
 | `/skills` | List the live shared-skills catalog (`/skills <id>` for detail) |
 | `/tools` | List the tools Hera can use (incl. MCP/custom) |
 | `/allow` | List `run_bash` allow patterns (or `/allow <pattern>` to add one) |
@@ -168,14 +172,22 @@ are restored on resume.
 
 ## Extending Hera — MCP & custom tools
 
-Hera is an **MCP client**. List MCP servers in `~/.config/hera/mcp.json` (Claude-Desktop shape);
-their tools appear as `mcp__<server>__<tool>`:
+Hera is an **MCP client** for both **local (stdio)** and **remote (HTTP/SSE)** servers. List them
+in `~/.config/hera/mcp.json` (Claude-Desktop shape); their tools appear as `mcp__<server>__<tool>`:
 
 ```json
 { "mcpServers": {
-    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"] }
+    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"] },
+    "remote":     { "url": "https://mcp.example.com/mcp", "token": "${MY_MCP_TOKEN}" }
 } }
 ```
+
+A server with a **`command`** is launched locally over stdio; one with a **`url`** is reached over
+the Streamable-HTTP transport (handles both JSON and SSE replies). For remote auth, `token`
+(or `auth_token`) becomes `Authorization: Bearer …` — the credential an OAuth flow ultimately
+issues (a personal-access/API token) — and a `headers` object sets anything else; both expand
+`${ENV}` so secrets stay out of the file. (Interactive browser-based OAuth sign-in isn't supplied —
+provide a token.)
 
 Or add **custom Python tools** at `~/.config/hera/tools.py` (global) or `.hera/tools.py`
 (per-project):
@@ -196,7 +208,22 @@ them, so they're trusted by construction; MCP servers are the untrusted surface.
 
 **Sub-agents:** the `task` tool delegates a self-contained subtask to a focused sub-agent that
 has the full toolset (minus `task`, so no recursion), shares the approval gate / sandbox /
-checkpoints, and returns a concise result.
+checkpoints, and returns a concise result. Define **named agents** with their own instructions in
+`~/.config/hera/agents/<name>.md` (optional `tools:` frontmatter to restrict the toolset) and
+target one with `task(agent="<name>", …)`.
+
+**Custom slash commands:** drop a `~/.config/hera/commands/<name>.md` file and run it as
+`/<name> [args]`; `$ARGUMENTS` in the file is replaced with what you type.
+
+## Plan mode, to-dos & cost
+
+For multi-step work Hera keeps a live **to-do checklist** (`todo_write`; ○ → ▸ → ✔, reprint with
+`/todos`) — the same pattern Claude Code uses — and prints a few **next-step suggestions** when a
+task finishes. **Plan mode** (`/plan` or `HERA_PLAN=1`) makes it research read-only and propose a
+numbered plan first; edits and commands stay blocked until you `/plan` again to approve. When the
+conversation nears the context window it **auto-compacts** (tune with `HERA_CONTEXT_TOKENS` /
+`HERA_AUTO_COMPACT_AT`). Set `HERA_PRICE_IN` / `HERA_PRICE_OUT` (USD per 1M tokens) to see an
+estimated **`$` cost** in the summaries and `/tokens`.
 
 ## Sandboxing & permissions
 
@@ -208,6 +235,12 @@ checkpoints, and returns a concise result.
 Pre-approve safe commands so they don't prompt: `HERA_ALLOW="git status,git diff*,pytest*"`,
 a `.heraallow` file (one pattern per line), `/allow <pattern>`, or **[a]/[p]** at a prompt. A
 built-in denylist (`rm -rf /`, `sudo …`, `mkfs`, `curl … | sh`, …) always forces a prompt.
+
+For finer control, `~/.config/hera/config.json` accepts a **`permissions`** block with per-tool
+`allow`/`ask`/`deny` rules — e.g. `"deny": ["run_bash(rm *)"]`, `"allow": ["run_bash(git *)"]`,
+`"ask": ["write_file"]` (`deny`/`ask` apply even under `HERA_YOLO`) — and a **`hooks`** block that
+runs your own shell commands on `PreToolUse` (a non-zero exit blocks the tool), `PostToolUse`, and
+`Stop`, each with an optional tool-name `matcher`.
 
 ## Project context
 
@@ -233,6 +266,10 @@ the live catalog the proxy is serving.
 | `HERA_YOLO` | `0` | `1` = auto-approve every tool call (sandbox only) |
 | `HERA_MAX_STEPS` | `25` | Max tool round-trips per message |
 | `HERA_HIDE_REASONING` | `0` | `1` = don't stream the model's thinking |
+| `HERA_PLAN` | `0` | `1` = start in plan mode (propose before editing) |
+| `HERA_NO_SUGGESTIONS` | `0` | `1` = don't print "Next steps" tips after a task |
+| `HERA_PRICE_IN` / `HERA_PRICE_OUT` | `0` | USD per 1M input/output tokens → show `$` cost |
+| `HERA_CONTEXT_TOKENS` / `HERA_AUTO_COMPACT_AT` | `32000` / `0.8` | Auto-compact history near the context window |
 | `HERA_VISION_URL` | _(empty)_ | Vision endpoint for attached images. Unset → images attached but not interpreted (text-only model) |
 | `HERA_VISION_MODEL` | = `HERA_MODEL` | Model name at `HERA_VISION_URL` |
 | `HERA_NO_COLOR` | `0` | `1` = disable colour/styling (also honours `NO_COLOR`) |
@@ -242,8 +279,8 @@ the live catalog the proxy is serving.
 | `HERA_ALLOW` | _(empty)_ | Comma-separated `run_bash` allow patterns (also reads `.heraallow`) |
 | `HERA_DENY` | _(empty)_ | Extra deny patterns (added to the built-in list) |
 | `HERA_SESSIONS_DIR` | `~/.config/hera/sessions` | Where session transcripts are saved |
-| `HERA_MCP_CONFIG` | `~/.config/hera/mcp.json` | MCP servers config (Claude-Desktop shape) |
-| `HERA_MCP_SANDBOX` | `0` | `1` = run MCP servers under the `run_bash` sandbox |
+| `HERA_MCP_CONFIG` | `~/.config/hera/mcp.json` | MCP servers — local (`command`) or remote (`url` + bearer `token`) |
+| `HERA_MCP_SANDBOX` | `0` | `1` = run local MCP servers under the `run_bash` sandbox |
 | `HERA_EMBED_URL` | = `HERA_API_URL` | Embeddings endpoint for `semantic_search` (server needs `--embeddings`) |
 | `HERA_EMBED_MODEL` | = `HERA_MODEL` | Model name for embeddings requests |
 | `HERA_NO_UPDATE_CHECK` | `0` | `1` = don't check for or show the update notice |
@@ -255,11 +292,11 @@ the live catalog the proxy is serving.
 
 ## Updating
 
-Current release: **0.8.0**. On launch Hera checks the published version (at most once a day,
+Current release: **0.8.1**. On launch Hera checks the published version (at most once a day,
 fail-silent) and prints a one-line notice when a newer one is out:
 
 ```
-↑ update available: Hera 0.8.0 (you have 0.6.1)
+↑ update available: Hera 0.8.1 (you have 0.6.1)
   re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
 ```
 

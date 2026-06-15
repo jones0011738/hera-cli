@@ -230,8 +230,10 @@ routed there automatically.
 | `symbols` | Codebase index of definitions | auto |
 | `semantic_search` | Embedding-ranked code search (if enabled) | auto |
 | `write_file`, `edit_file` | Create / edit a file | prompts |
-| `run_bash` | Run a shell command (sandboxed) | prompts |
-| `task` | Delegate a subtask to a sub-agent | runs (inner calls prompt) |
+| `run_bash` | Run a shell command (sandboxed; `run_in_background` for servers/watchers) | prompts |
+| `bash_output`, `bash_kill` | Read / stop a background `run_bash` job | auto / prompts |
+| `todo_write` | Maintain the on-screen task checklist | auto |
+| `task` | Delegate a subtask to a sub-agent (optional named `agent`) | runs (inner calls prompt) |
 
 ### In-session commands
 
@@ -239,8 +241,10 @@ routed there automatically.
 |---|---|
 | `/undo` | Revert the last file write/edit |
 | `/diff` | Show the working-tree `git diff` |
-| `/compact` | Summarize the conversation to free context |
-| `/tokens` | Token usage this session |
+| `/compact` | Summarize the conversation to free context (also automatic near the limit) |
+| `/tokens` | Token usage (and `$` cost, if priced) this session |
+| `/plan` | Toggle plan mode — investigate & propose before editing |
+| `/todos` | Show the current task checklist |
 | `/skills` | List the live shared-skills catalog (`/skills <id>` for detail) |
 | `/tools` | List tools (incl. MCP/custom) |
 | `/allow [pat]` | List or add `run_bash` allow patterns |
@@ -258,6 +262,14 @@ Conversations auto-save under `~/.config/hera/sessions/<you>/`. Resume with
 the account email your key resolves to (or `HERA_USER` if set, or a hash of the key before any
 email is known), so users never share context on one machine.
 
+### Plan mode, to-dos, and next-step tips
+
+Like Claude Code, Hera lays out a **to-do checklist** (`todo_write`) for multi-step tasks and
+updates it live (○ pending → ▸ in-progress → ✔ done; `/todos` reprints it). **Plan mode**
+(`/plan` or `HERA_PLAN=1`) makes it investigate read-only and propose a numbered plan before
+touching anything — file edits and commands stay disabled until you `/plan` again to approve.
+After a task that used tools, it prints a few **next-step suggestions**.
+
 ### Sandboxing & permissions
 
 `run_bash` runs sandboxed by default: **bubblewrap** (filesystem confined to the working dir,
@@ -265,6 +277,13 @@ network on) if installed, else `unshare` (PID isolation, network on), else none.
 turns network back off if you want a stricter shell sandbox; `/sandbox` shows the active level. Pre-approve
 safe commands with `HERA_ALLOW`, a `.heraallow` file, `/allow`, or `[a]`/`[p]` at a prompt; a
 built-in denylist always forces a prompt for dangerous commands.
+
+For finer control, `~/.config/hera/config.json` accepts a **`permissions`** block with
+`allow`/`ask`/`deny` rules per tool — e.g. `"deny": ["run_bash(rm *)"]`,
+`"allow": ["run_bash(git *)"]`, `"ask": ["write_file"]` (`deny`/`ask` apply even under YOLO) — and a
+**`hooks`** block running your own commands on `PreToolUse` (a non-zero exit blocks the tool),
+`PostToolUse`, and `Stop`. With pricing set (`HERA_PRICE_IN`/`HERA_PRICE_OUT`, USD per 1M tokens),
+summaries and `/tokens` show an estimated **`$` cost**.
 
 ### Project context
 
@@ -293,14 +312,18 @@ chat is using.
 | `HERA_YOLO` | `0` | `1` = auto-approve every tool call. Sandbox only. |
 | `HERA_MAX_STEPS` | `25` | Max tool round-trips per message. |
 | `HERA_HIDE_REASONING` | `0` | `1` = don't stream the model's thinking. |
+| `HERA_PLAN` | `0` | `1` = start in plan mode (propose before editing). |
+| `HERA_NO_SUGGESTIONS` | `0` | `1` = don't print "Next steps" tips after a task. |
+| `HERA_PRICE_IN` / `HERA_PRICE_OUT` | `0` | USD per 1M input/output tokens → show `$` cost. |
+| `HERA_CONTEXT_TOKENS` / `HERA_AUTO_COMPACT_AT` | `32000` / `0.8` | Auto-compact history near the context window. |
 | `HERA_VISION_URL` | _(empty)_ | Vision endpoint for attached images. Unset → images attached but not interpreted (text-only model). |
 | `HERA_VISION_MODEL` | = `HERA_MODEL` | Model name at `HERA_VISION_URL`. |
 | `HERA_NO_COLOR` / `HERA_FORCE_COLOR` | `0` | Disable / force colour. |
 | `HERA_SANDBOX` | `auto` | `auto` / `bwrap` / `unshare` / `none`. |
 | `HERA_SANDBOX_NET` | `1` | `0` = block network in the sandbox. |
 | `HERA_ALLOW` / `HERA_DENY` | _(empty)_ | `run_bash` allow / extra-deny patterns. |
-| `HERA_MCP_CONFIG` | `~/.config/hera/mcp.json` | MCP servers (Claude-Desktop shape). |
-| `HERA_MCP_SANDBOX` | `0` | `1` = run MCP servers under the sandbox. |
+| `HERA_MCP_CONFIG` | `~/.config/hera/mcp.json` | MCP servers — local (`command`) or remote (`url` + bearer `token`). |
+| `HERA_MCP_SANDBOX` | `0` | `1` = run local MCP servers under the sandbox. |
 | `HERA_EMBED_URL` / `HERA_EMBED_MODEL` | = API | Embeddings endpoint for `semantic_search`. |
 | `HERA_SESSIONS_DIR` | `~/.config/hera/sessions` | Session store root (namespaced per user). |
 | `HERA_NO_UPDATE_CHECK` | `0` | `1` = don't check for or show the update notice. |
@@ -309,12 +332,12 @@ chat is using.
 
 ## 6. Keeping Hera up to date
 
-The current release is **0.8.0**. On launch Hera checks the published version (at most once a
+The current release is **0.8.1**. On launch Hera checks the published version (at most once a
 day, fail-silent — it never blocks or errors startup). If a newer one is out, you'll see a
 one-line notice like:
 
 ```
-↑ update available: Hera 0.8.0 (you have 0.6.1)
+↑ update available: Hera 0.8.1 (you have 0.6.1)
   re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
 ```
 

@@ -6,6 +6,9 @@ history**, and an admin decides who's allowed in. Your account here is the **sam
 use for the Hera CLI and the VS Code extension — one login, three surfaces.
 
 > See also [`ACCESS_CLI.md`](ACCESS_CLI.md) (terminal) and [`ACCESS_VSCODE.md`](ACCESS_VSCODE.md).
+> Web chat is the simplest surface (chat + 🌐 web search). For a full Claude-Code-style coding
+> agent on the **same account** — to-do plans, plan mode, file edits, shell, hooks, permissions,
+> custom commands/agents, and MCP — use the CLI or the VS Code extension.
 
 ---
 

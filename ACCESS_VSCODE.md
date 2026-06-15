@@ -44,7 +44,7 @@ automatically, or you can force one explicitly with `@skill:<id>` or `/skill <id
    ```
    (Or set `hera.command` in the extension settings to an absolute path — e.g.
    `~/.local/bin/hera`, or on Windows the full path to your `hera.py` launcher.) Confirm it's
-   found: `hera --version` should print `Hera 0.8.0`.
+   found: `hera --version` should print `Hera 0.8.1`.
 3. **Credentials.** Easiest: **run `hera` once in a terminal and paste your key** (see
    [`ACCESS_CLI.md`](ACCESS_CLI.md)). That saves `~/.config/hera/config.json` (endpoint + key +
    your resolved account email), and `hera --serve` — what the extension drives — reads that file
@@ -139,7 +139,12 @@ Open the **Command Palette** (`Ctrl/Cmd+Shift+P`) and type "Hera", or use the ke
 - **Attach an image** with the **📎** button, or **paste**/**drag-drop** one into the message box;
   it shows as a thumbnail chip. The base model is text-only, so set `hera.visionUrl` (a vision
   endpoint) to actually analyze images — otherwise they're attached but not interpreted.
-- Per-turn token usage is shown.
+- For multi-step work a **"Plan" checklist** appears and updates live (✔ done / ▸ in-progress /
+  ○ pending) — the same to-do tracking as Claude Code.
+- When a task finishes, a **"Next steps"** block of clickable suggestion chips appears; click one to
+  drop it into the message box.
+- Per-turn token usage is shown — plus an estimated **`$` cost** when pricing is set
+  (`hera.extraEnv` → `HERA_PRICE_IN` / `HERA_PRICE_OUT`).
 
 ---
 
@@ -173,7 +178,9 @@ same per-user auth via your Open WebUI key.
 ## Scope
 
 Real today: chat panel with streaming thinking + step narration, proposed-edit diffs shown
-before they're applied, reject-with-feedback, Stop/interrupt, image attachments, LSP context, and
-terminal commands. Not yet: applying edits through VS Code's own edit API (Hera writes to disk via
-its tools, shown as a diff), built-in vision (set `hera.visionUrl` to a vision endpoint), and a
-Marketplace listing.
+before they're applied, reject-with-feedback, Stop/interrupt, image attachments, LSP context,
+terminal commands, the live **Plan checklist**, **Next-step** suggestion chips, and **`$` cost** —
+plus everything the CLI gained (plan mode, hooks, permissions, custom commands/agents, background
+shell, remote MCP), since the panel drives the same `hera`. Not yet: applying edits through VS
+Code's own edit API (Hera writes to disk via its tools, shown as a diff), built-in vision (set
+`hera.visionUrl` to a vision endpoint), and a Marketplace listing.

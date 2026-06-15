@@ -139,7 +139,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.7.0"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.7.1"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -1544,15 +1544,16 @@ def _parse_suggestions(raw):
     return out
 
 
-def _suggest_next_steps(messages):
-    """After a task wraps up, offer a few concrete next steps — like Claude
-    Code's end-of-task suggestions — so the user knows where to go next.
+def _generate_suggestions(messages):
+    """Ask the model for 2-3 concrete next steps based on the just-finished task.
 
-    Best-effort and quiet: only on an interactive TTY, skipped on any error, and
-    disabled entirely with HERA_NO_SUGGESTIONS=1.
+    Returns a list of short strings (possibly empty). Best-effort: returns [] on
+    any error or when disabled with HERA_NO_SUGGESTIONS=1. Shared by the
+    interactive CLI and the --serve path (VS Code), so it neither prints nor
+    touches the TTY.
     """
-    if _truthy(_env("HERA_NO_SUGGESTIONS")) or not sys.stdout.isatty():
-        return
+    if _truthy(_env("HERA_NO_SUGGESTIONS")):
+        return []
     recent = []
     for m in messages[-10:]:
         role = m.get("role")
@@ -1564,7 +1565,7 @@ def _suggest_next_steps(messages):
         if c.strip():
             recent.append(f"{role}: {c[:600]}")
     if not recent:
-        return
+        return []
     prompt = (
         "You are a terminal coding assistant that just finished a task. From the session "
         "transcript below, propose 2-3 concrete, genuinely useful next steps the user could "
@@ -1572,8 +1573,6 @@ def _suggest_next_steps(messages):
         "a short imperative phrase of at most 9 words, specific to what was just done. Reply "
         "with ONLY a JSON array of strings — no prose, no numbering.\n\n" + "\n".join(recent)
     )
-    spin = Spinner()
-    spin.start(label="figuring out next steps")
     try:
         resp = requests.post(
             f"{API_URL}/chat/completions",
@@ -1589,14 +1588,25 @@ def _suggest_next_steps(messages):
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"].get("content") or ""
     except Exception:  # noqa: BLE001 — suggestions are a nicety, never fatal
-        spin.stop()
+        return []
+    return _parse_suggestions(raw)[:3]
+
+
+def _suggest_next_steps(messages):
+    """Interactive (TTY) end-of-task next-step tips — like Claude Code's. Quiet:
+    TTY only; the disable/error handling lives in _generate_suggestions."""
+    if not sys.stdout.isatty():
         return
-    spin.stop()
-    steps = _parse_suggestions(raw)
+    spin = Spinner()
+    spin.start(label="figuring out next steps")
+    try:
+        steps = _generate_suggestions(messages)
+    finally:
+        spin.stop()
     if not steps:
         return
     print(f"{DIM}  Next steps{R}")
-    for s in steps[:3]:
+    for s in steps:
         print(f"  {ACCENT}›{R} {s}")
     print()
 
@@ -2808,7 +2818,7 @@ def print_help():
 #        | {"type":"approval","decision":"y|a|p|n","feedback":"…"}
 #        | {"type":"interrupt"} | {"type":"undo"} | {"type":"clear"} | {"type":"exit"}
 #   out: ready | reasoning | token | narration | tool_start | proposed_diff
-#        | approval_request | tool_end | turn_end | info | error
+#        | approval_request | tool_end | turn_end | suggestions | info | error
 #
 # A single reader thread (_serve_input_thread) demultiplexes stdin so the editor
 # can send an `interrupt` or an `approval` *while* a turn is streaming: approvals
@@ -3015,6 +3025,7 @@ def _serve_exec(c):
 
 def _serve_run(messages):
     turn = 0
+    did_work = False   # used tools this turn? gates the next-step suggestions
     for _ in range(MAX_STEPS):
         res = _serve_stream(messages)
         if res is None:
@@ -3038,7 +3049,15 @@ def _serve_run(messages):
         if not calls:
             _emit({"type": "turn_end", "content": res["content"] or "",
                    "turn_tokens": turn, "session_tokens": dict(SESSION)})
+            # End-of-task next-step tips for the editor UI (same feature the
+            # interactive CLI prints). Emitted after turn_end so the panel has
+            # already unblocked; best-effort, so a failure is silently dropped.
+            if did_work:
+                items = _generate_suggestions(messages)
+                if items:
+                    _emit({"type": "suggestions", "items": items})
             return
+        did_work = True
         for c in calls:
             out = _serve_exec(c)
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": out})

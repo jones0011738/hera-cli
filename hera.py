@@ -153,7 +153,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.14"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.17"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -161,6 +161,15 @@ NAME    = _env("HERA_NAME", default="Hera")
 API_URL = _cfg("HERA_API_URL", "QWEN_API_URL", key="api_url", default="").rstrip("/")
 MODEL   = _env("HERA_MODEL",   "QWEN_MODEL",   default="qwen3.6-35b-a3b")
 API_KEY = _cfg("HERA_API_KEY", "QWEN_API_KEY", "LLAMA_API_KEY", key="api_key", default="")
+
+# Provider backend. "openai" (default) talks to any OpenAI-compatible endpoint
+# (llama.cpp, vLLM, OpenAI, etc.). "anthropic"/"bedrock"/"vertex" use the native
+# Anthropic Messages API (Bedrock & Vertex are base-URL + auth variants of it).
+PROVIDER = (_cfg("HERA_PROVIDER", key="provider", default="openai") or "openai").lower()
+ANTHROPIC_BASE = _cfg("HERA_ANTHROPIC_BASE", key="anthropic_base",
+                      default="https://api.anthropic.com").rstrip("/")
+ANTHROPIC_VERSION = _env("HERA_ANTHROPIC_VERSION", default="2023-06-01")
+MAX_OUTPUT_TOKENS = int(_env("HERA_MAX_OUTPUT_TOKENS", default="8192") or 8192)
 # Vision: the main model is text-only. If a vision-capable OpenAI-compatible
 # endpoint is configured, turns that carry an attached image are routed to it;
 # otherwise images are attached but flagged as not-interpreted (see stream_turn).
@@ -240,6 +249,85 @@ _HOOK_CONTEXT = ""   # stdout from the last UserPromptSubmit/SessionStart hooks
 # Each entry is "tool" or "tool(<glob>)" — e.g. "run_bash(git *)", "edit_file(src/**)".
 _PERMS = _FILE_CFG.get("permissions") if isinstance(_FILE_CFG.get("permissions"), dict) else {}
 
+# Enterprise managed policy (read-only, admin-controlled): a JSON file that
+# OVERRIDES user config and cannot be loosened by the user. Keys:
+#   permissions {deny,ask,allow}  — managed rules win over everything
+#   disable_bypass: true          — forces YOLO/bypass off
+#   max_auto_mode: read|edit|all  — caps the per-project auto-approve level
+#   deny_patterns: ["rm -rf *"]   — extra run_bash deny patterns
+def _load_managed_policy():
+    path = _env("HERA_MANAGED_POLICY") or "/etc/hera/managed-policy.json"
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+MANAGED_POLICY = _load_managed_policy()
+_MANAGED_PERMS = MANAGED_POLICY.get("permissions") if isinstance(
+    MANAGED_POLICY.get("permissions"), dict) else {}
+
+# Telemetry (OpenTelemetry-style): emit usage/events to an OTLP-ish HTTP endpoint
+# and/or a local JSONL file. Off unless a sink is configured.
+TELEMETRY_LOG = _cfg("HERA_TELEMETRY_LOG", key="telemetry_log", default="")
+OTEL_ENDPOINT = _cfg("HERA_OTEL_ENDPOINT", key="otel_endpoint", default="").rstrip("/")
+TELEMETRY_ON = bool(TELEMETRY_LOG or OTEL_ENDPOINT)
+
+# Enterprise policy can force bypass/YOLO off; the user can't re-enable it.
+if MANAGED_POLICY.get("disable_bypass"):
+    YOLO = False
+
+
+def _managed_cap_auto_mode(mode):
+    """Clamp an auto-approve level to the managed policy's ceiling, if any."""
+    cap = MANAGED_POLICY.get("max_auto_mode")
+    order = {"read": 0, "edit": 1, "all": 2}
+    if cap in order and order.get(mode, 0) > order[cap]:
+        return cap
+    return mode
+
+
+_TELEMETRY_LOCK = threading.Lock()
+
+
+def _otlp_log(event, attrs):
+    """Minimal OTLP/HTTP logs payload for one event."""
+    return {"resourceLogs": [{
+        "resource": {"attributes": [
+            {"key": "service.name", "value": {"stringValue": "hera"}},
+            {"key": "service.version", "value": {"stringValue": VERSION}}]},
+        "scopeLogs": [{"logRecords": [{
+            "timeUnixNano": int(time.time() * 1e9),
+            "body": {"stringValue": event},
+            "attributes": [{"key": k, "value": {"stringValue": str(v)}}
+                           for k, v in attrs.items()]}]}]}]}
+
+
+def _emit_telemetry(event, **attrs):
+    """Emit a usage/event record to the configured telemetry sinks (JSONL file
+    and/or an OTLP/HTTP endpoint). Best-effort; never raises, never blocks long."""
+    if not TELEMETRY_ON:
+        return
+    rec = {"ts": time.time(), "event": event,
+           "session": CURRENT_SESSION.get("id"), "model": MODEL,
+           "provider": PROVIDER, **attrs}
+    if TELEMETRY_LOG:
+        try:
+            with _TELEMETRY_LOCK, open(os.path.expanduser(TELEMETRY_LOG), "a",
+                                       encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except OSError:
+            pass
+    if OTEL_ENDPOINT:
+        try:
+            requests.post(f"{OTEL_ENDPOINT}/v1/logs", json=_otlp_log(event, rec),
+                          timeout=3)
+        except Exception:  # noqa: BLE001 — telemetry must never break a turn
+            pass
+
 # Plan mode: read-only investigation; mutating tools are blocked until the user
 # approves the plan (toggle with /plan, or a {"type":"plan"} message in --serve).
 PLAN_MODE = _truthy(_env("HERA_PLAN"))
@@ -261,10 +349,10 @@ def _project_key():
 def _load_auto_mode():
     env = _env("HERA_AUTO_MODE").lower()
     if env in _AUTO_LEVELS:
-        return env
+        return _managed_cap_auto_mode(env)
     modes = _FILE_CFG.get("auto_modes")
     if isinstance(modes, dict) and modes.get(_project_key()) in _AUTO_LEVELS:
-        return modes[_project_key()]
+        return _managed_cap_auto_mode(modes[_project_key()])
     return "read"
 
 
@@ -1832,11 +1920,151 @@ def _extract_text_tool_calls(content):
     return cleaned.strip(), calls
 
 
+# ── Anthropic-native provider (Messages API; Bedrock/Vertex are auth variants) ─
+def _is_anthropic():
+    return PROVIDER in ("anthropic", "bedrock", "vertex")
+
+
+def _anthropic_tools(schemas):
+    """Convert OpenAI function schemas to Anthropic tool definitions."""
+    out = []
+    for s in schemas:
+        f = s.get("function", {})
+        out.append({"name": f["name"], "description": f.get("description", ""),
+                    "input_schema": f.get("parameters") or {"type": "object", "properties": {}}})
+    return out
+
+
+def _to_anthropic_messages(messages):
+    """Translate OpenAI-style history → (system_str, anthropic_messages).
+
+    assistant tool_calls → tool_use blocks; role:tool → user tool_result blocks;
+    multimodal image_url parts → Anthropic image blocks. Consecutive same-role
+    messages are merged so roles alternate as the API expects."""
+    system_parts, out = [], []
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            t = _text_of(m.get("content"))
+            if t:
+                system_parts.append(t)
+            continue
+        if role == "tool":
+            out.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": m.get("tool_call_id", ""),
+                 "content": _text_of(m.get("content"))}]})
+            continue
+        if role == "assistant":
+            blocks = []
+            txt = _text_of(m.get("content"))
+            if txt:
+                blocks.append({"type": "text", "text": txt})
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function", {})
+                try:
+                    inp = json.loads(fn.get("arguments") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    inp = {}
+                blocks.append({"type": "tool_use", "id": tc.get("id", ""),
+                               "name": fn.get("name", ""), "input": inp})
+            out.append({"role": "assistant", "content": blocks or [{"type": "text", "text": ""}]})
+            continue
+        # user
+        c = m.get("content")
+        if isinstance(c, list):
+            blocks = []
+            for part in c:
+                if part.get("type") == "text":
+                    blocks.append({"type": "text", "text": part.get("text", "")})
+                elif part.get("type") == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    if url.startswith("data:") and "," in url:
+                        meta, b64 = url.split(",", 1)
+                        mime = meta[5:].split(";")[0] or "image/png"
+                        blocks.append({"type": "image", "source": {
+                            "type": "base64", "media_type": mime, "data": b64}})
+            out.append({"role": "user", "content": blocks or [{"type": "text", "text": ""}]})
+        else:
+            out.append({"role": "user", "content": c or ""})
+    # Merge consecutive same-role messages (Anthropic wants alternating turns).
+    merged = []
+    for msg in out:
+        if merged and merged[-1]["role"] == msg["role"]:
+            prev = merged[-1]
+            for blk in (prev, msg):
+                if isinstance(blk["content"], str):
+                    blk["content"] = [{"type": "text", "text": blk["content"]}]
+            prev["content"] = prev["content"] + msg["content"]
+        else:
+            merged.append(dict(msg))
+    return "\n\n".join(system_parts), merged
+
+
+def _parse_anthropic_response(data):
+    """Convert an Anthropic Messages response dict → internal turn shape."""
+    parts, tool_calls = [], []
+    for block in data.get("content", []) or []:
+        bt = block.get("type")
+        if bt == "text":
+            parts.append(block.get("text", ""))
+        elif bt == "tool_use":
+            tool_calls.append({"id": block.get("id", ""), "name": block.get("name", ""),
+                               "arguments": json.dumps(block.get("input", {}))})
+    u = data.get("usage", {}) or {}
+    pin, pout = u.get("input_tokens", 0), u.get("output_tokens", 0)
+    usage = {"prompt_tokens": pin, "completion_tokens": pout, "total_tokens": pin + pout}
+    fr = "tool_calls" if tool_calls else (data.get("stop_reason") or "stop")
+    return {"content": "".join(parts), "tool_calls": tool_calls,
+            "finish_reason": fr, "usage": usage}
+
+
+def _anthropic_headers():
+    """Auth + base URL for the active Anthropic-family provider."""
+    if PROVIDER == "vertex":            # GCP: OAuth bearer access token in API_KEY
+        return ANTHROPIC_BASE, {"Authorization": f"Bearer {API_KEY}",
+                                "Content-Type": "application/json"}
+    if PROVIDER == "bedrock":           # AWS: expects SigV4 (front with a proxy) or a bearer
+        return ANTHROPIC_BASE, {"Authorization": f"Bearer {API_KEY}",
+                                "Content-Type": "application/json"}
+    return ANTHROPIC_BASE, {"x-api-key": API_KEY, "anthropic-version": ANTHROPIC_VERSION,
+                            "Content-Type": "application/json"}
+
+
+def _anthropic_turn(messages, spinner, tools=None):
+    """One turn against the Anthropic Messages API. Non-streaming for robustness;
+    prints the answer once it arrives. Returns the internal turn dict or None."""
+    base, headers = _anthropic_headers()
+    system, amsgs = _to_anthropic_messages(messages)
+    schemas = tools if tools is not None else TOOL_SCHEMAS
+    body = {"model": MODEL, "max_tokens": MAX_OUTPUT_TOKENS, "messages": amsgs,
+            "tools": _anthropic_tools(schemas)}
+    if system:
+        body["system"] = system
+    try:
+        resp = requests.post(f"{base}/v1/messages", json=body, headers=headers, timeout=600)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.RequestException as exc:
+        spinner.stop()
+        print(f"{RED}[error] {exc}{R}\n", file=sys.stderr)
+        return None
+    result = _parse_anthropic_response(data)
+    spinner.stop()
+    if result["content"]:
+        print(f"\n{ACCENT}▌{R} {BOLD}{NAME}{R}\n")
+        md_state = {"code": False}
+        for ln in result["content"].split("\n"):
+            print(render_md_line(ln, md_state), flush=True)
+    return result
+
+
 def stream_turn(messages, spinner, tools=None):
     """One model turn. Streams reasoning + content live; assembles tool calls.
 
     Returns dict {content, finish_reason, tool_calls, usage} or None on error.
     """
+    if _is_anthropic():
+        return _anthropic_turn(messages, spinner, tools)
     # Transient blips (server busy under --parallel load, a dropped connection)
     # return 5xx/connection errors. Retry a few times with backoff before giving
     # up, so one hiccup doesn't end the turn.
@@ -2030,6 +2258,7 @@ def _account(usage):
     SESSION["completion"] += c
     SESSION["total"]      += t
     SESSION["requests"]   += 1
+    _emit_telemetry("request", prompt_tokens=p, completion_tokens=c, total_tokens=t)
     return t
 
 
@@ -2434,6 +2663,7 @@ def _exec_call(c, indent=""):
     if name == "todo_write" and TODOS and not is_err:
         print(_render_todos_text())
     _run_hooks("PostToolUse", name, args, output)
+    _emit_telemetry("tool", tool=name, error=is_err)
 
     if len(output) > MAX_TOOL_OUTPUT:
         output = output[:MAX_TOOL_OUTPUT] + f"\n…[truncated, {len(output)} chars total]"
@@ -2825,11 +3055,15 @@ def _perm_match(entry, name, args):
 
 
 def _perm_decision(name, args):
-    """Return 'allow' / 'deny' / 'ask' from config permissions, or None if no rule."""
-    for bucket in ("deny", "ask", "allow"):
-        for entry in (_PERMS.get(bucket) or []):
-            if _perm_match(entry, name, args):
-                return bucket
+    """Return 'allow' / 'deny' / 'ask' from permissions, or None if no rule.
+
+    Enterprise managed-policy rules are consulted FIRST and cannot be loosened by
+    the user; user config is checked only if no managed rule matched."""
+    for perms in (_MANAGED_PERMS, _PERMS):
+        for bucket in ("deny", "ask", "allow"):
+            for entry in (perms.get(bucket) or []):
+                if _perm_match(entry, name, args):
+                    return bucket
     return None
 
 
@@ -2866,6 +3100,100 @@ def _parse_frontmatter(text):
 
 CUSTOM_COMMANDS = _load_markdown_dir(COMMANDS_DIR)
 CUSTOM_AGENTS = _load_markdown_dir(AGENTS_DIR)
+
+
+# ── Plugins & marketplaces (local, directory-based) ───────────────────────────
+# A plugin is a directory under ~/.config/hera/plugins/<name>/ that may bundle:
+#   plugin.json  (name/version/description/enabled)
+#   commands/*.md   agents/*.md   mcp.json
+# A marketplace is ~/.config/hera/marketplaces/<name>.json listing installable
+# plugins ({name, description, source}); source is a local path or a git URL.
+PLUGINS_DIR = os.path.join(CONFIG_DIR, "plugins")
+MARKETPLACES_DIR = os.path.join(CONFIG_DIR, "marketplaces")
+PLUGINS = []  # populated by load_plugins()
+
+
+def load_plugins():
+    """Discover enabled plugins, merge their commands/agents into the registries,
+    and return a list of plugin info dicts (with any mcp.json path)."""
+    found = []
+    if not os.path.isdir(PLUGINS_DIR):
+        return found
+    for name in sorted(os.listdir(PLUGINS_DIR)):
+        pdir = os.path.join(PLUGINS_DIR, name)
+        if not os.path.isdir(pdir):
+            continue
+        manifest = {}
+        mpath = os.path.join(pdir, "plugin.json")
+        if os.path.isfile(mpath):
+            try:
+                with open(mpath, encoding="utf-8") as f:
+                    manifest = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                manifest = {}
+        if manifest.get("enabled") is False:
+            continue
+        cmds = _load_markdown_dir(os.path.join(pdir, "commands"))
+        agents = _load_markdown_dir(os.path.join(pdir, "agents"))
+        for k, v in cmds.items():
+            CUSTOM_COMMANDS.setdefault(k, v)        # user's own dir wins on clash
+        for k, v in agents.items():
+            CUSTOM_AGENTS.setdefault(k, v)
+        mcp_path = os.path.join(pdir, "mcp.json")
+        found.append({"name": manifest.get("name", name), "dir": pdir,
+                      "version": manifest.get("version", ""),
+                      "description": manifest.get("description", ""),
+                      "commands": list(cmds), "agents": list(agents),
+                      "mcp": mcp_path if os.path.isfile(mcp_path) else None})
+    PLUGINS[:] = found
+    return found
+
+
+def marketplace_catalog():
+    """Aggregate installable plugins from all marketplace index files."""
+    out = []
+    if not os.path.isdir(MARKETPLACES_DIR):
+        return out
+    for fn in sorted(os.listdir(MARKETPLACES_DIR)):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(MARKETPLACES_DIR, fn), encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        for p in (data.get("plugins") or []):
+            if isinstance(p, dict) and p.get("name"):
+                out.append({**p, "marketplace": fn[:-5]})
+    return out
+
+
+def install_plugin(name, source=None):
+    """Install a plugin into PLUGINS_DIR from a local path or git URL. If `source`
+    is omitted, resolve `name` against the marketplace catalog. Returns a message."""
+    if source is None:
+        match = next((p for p in marketplace_catalog() if p["name"] == name), None)
+        if not match:
+            return f"[error] no plugin {name!r} in any marketplace"
+        source = match.get("source", "")
+    dest = os.path.join(PLUGINS_DIR, name)
+    if os.path.exists(dest):
+        return f"[error] already installed: {dest}"
+    os.makedirs(PLUGINS_DIR, exist_ok=True)
+    src = os.path.expanduser(source)
+    if os.path.isdir(src):                      # local path → copy
+        try:
+            shutil.copytree(src, dest)
+        except OSError as exc:
+            return f"[error] copy failed: {exc}"
+        return f"installed {name} ← {src}"
+    if source.endswith(".git") or source.startswith(("http://", "https://", "git@")):
+        proc = subprocess.run(["git", "clone", "--depth", "1", source, dest],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            return f"[error] git clone failed: {(proc.stderr or '').strip()[:200]}"
+        return f"installed {name} ← {source}"
+    return f"[error] unusable source: {source!r}"
 
 
 # ── Session persistence / resume ──────────────────────────────────────────────
@@ -3410,14 +3738,13 @@ def _register_tool(name, description, parameters, func, read_only=False):
         SIDE_EFFECTS.add(name)
 
 
-def register_mcp():
-    if not os.path.isfile(MCP_CONFIG):
-        return []
+def _register_mcp_file(path):
+    """Start the MCP servers declared in one config file; return tool names."""
     try:
-        with open(MCP_CONFIG, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             cfg = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"{YELL}[mcp] bad config {MCP_CONFIG}: {exc}{R}", file=sys.stderr)
+        print(f"{YELL}[mcp] bad config {path}: {exc}{R}", file=sys.stderr)
         return []
     servers = cfg.get("mcpServers", cfg if isinstance(cfg, dict) else {})
     loaded = []
@@ -3442,6 +3769,17 @@ def register_mcp():
             _register_tool(full, t.get("description", f"MCP tool {t['name']} ({sname})"),
                            t.get("inputSchema"), run)
             loaded.append(full)
+    return loaded
+
+
+def register_mcp():
+    """Load the main mcp.json plus any mcp.json bundled by installed plugins."""
+    loaded = []
+    if os.path.isfile(MCP_CONFIG):
+        loaded += _register_mcp_file(MCP_CONFIG)
+    for p in PLUGINS:
+        if p.get("mcp"):
+            loaded += _register_mcp_file(p["mcp"])
     return loaded
 
 
@@ -3487,9 +3825,14 @@ def register_semantic_search():
 
 
 def register_extensions(quiet=False):
+    plugins = load_plugins()   # merges plugin commands/agents before the rest load
     mcp = register_mcp()
     custom = register_custom_tools()
     out = sys.stderr if quiet else sys.stdout   # serve mode keeps stdout JSON-only
+    if plugins:
+        print(f"{DIM}[ext] loaded {len(plugins)} plugin(s): "
+              f"{', '.join(p['name'] for p in plugins[:6])}"
+              f"{'…' if len(plugins) > 6 else ''}{R}", file=out)
     if mcp:
         print(f"{DIM}[ext] loaded {len(mcp)} MCP tool(s): {', '.join(mcp[:6])}"
               f"{'…' if len(mcp) > 6 else ''}{R}", file=out)
@@ -3915,6 +4258,7 @@ SLASH_COMMANDS = [
     ("/rewind",    "[n]",       "restore conversation AND files to an earlier turn"),
     ("/context",   "",          "show how the context window is being used"),
     ("/memory",    "",          "show loaded memory files (add with # <fact>)"),
+    ("/plugins",   "[install]", "list plugins, browse the marketplace, or install one"),
     ("/diff",      "",          "show the working-tree git diff"),
     ("/compact",   "",          "summarize the conversation to free up context"),
     ("/tokens",    "",          "show token usage (and cost, if priced) this session"),
@@ -4344,8 +4688,30 @@ def _serve_input_thread():
             _MAIN_Q.put(msg)
 
 
+def _serve_anthropic(messages):
+    """Anthropic-provider turn for --serve: non-streaming, emits the answer once."""
+    base, headers = _anthropic_headers()
+    system, amsgs = _to_anthropic_messages(messages)
+    body = {"model": MODEL, "max_tokens": MAX_OUTPUT_TOKENS, "messages": amsgs,
+            "tools": _anthropic_tools(TOOL_SCHEMAS)}
+    if system:
+        body["system"] = system
+    try:
+        resp = requests.post(f"{base}/v1/messages", json=body, headers=headers, timeout=600)
+        resp.raise_for_status()
+        result = _parse_anthropic_response(resp.json())
+    except requests.exceptions.RequestException as exc:
+        _emit({"type": "error", "message": str(exc)})
+        return None
+    if result["content"]:
+        _emit({"type": "token", "delta": result["content"]})
+    return result
+
+
 def _serve_stream(messages):
     global _VISION_WARNED
+    if _is_anthropic():
+        return _serve_anthropic(messages)
     url, model, send_messages, downgraded = _select_endpoint(messages)
     if downgraded and not _VISION_WARNED:
         _VISION_WARNED = True
@@ -4979,11 +5345,14 @@ def main():
     _run_hooks("SessionStart")
     if _HOOK_CONTEXT and messages:
         messages[0]["content"] += f"\n\n<session-start-context>\n{_HOOK_CONTEXT}\n</session-start-context>"
+    _emit_telemetry("session_start")
 
     try:
         _repl(messages, spinner)
     finally:
         _run_hooks("SessionEnd")
+        _emit_telemetry("session_end", total_tokens=SESSION.get("total", 0),
+                        requests=SESSION.get("requests", 0))
         save_session(messages)
         close_extensions()
 
@@ -5080,6 +5449,42 @@ def _repl(messages, spinner):
             continue
         if cmd == "/memory":
             memory_report()
+            continue
+        if cmd == "/plugins" or cmd.startswith("/plugins "):
+            arg = user_input[8:].strip()
+            if arg.startswith("install "):
+                msg = install_plugin(arg[8:].strip())
+                print(f"\n{DIM}{msg}{R}")
+                if not msg.startswith("[error]"):
+                    register_extensions(quiet=True)  # pick up the new plugin now
+                print()
+            elif arg in ("market", "marketplace", "available"):
+                cat = marketplace_catalog()
+                if not cat:
+                    print(f"\n{DIM}no marketplaces. Add index files in {MARKETPLACES_DIR}/<name>.json{R}\n")
+                else:
+                    print(f"\n{BOLD}Available plugins{R}")
+                    for p in cat:
+                        print(f"  {CYAN}{p['name']}{R} {DIM}[{p['marketplace']}] "
+                              f"{p.get('description', '')}{R}")
+                    print(f"{DIM}  install with {R}{CYAN}/plugins install <name>{R}\n")
+            else:
+                if not PLUGINS:
+                    print(f"\n{DIM}no plugins installed. See {R}{CYAN}/plugins marketplace{R}"
+                          f"{DIM}; install dirs live in {PLUGINS_DIR}{R}\n")
+                else:
+                    print(f"\n{BOLD}Installed plugins{R}")
+                    for p in PLUGINS:
+                        bits = []
+                        if p["commands"]:
+                            bits.append(f"{len(p['commands'])} cmd")
+                        if p["agents"]:
+                            bits.append(f"{len(p['agents'])} agent")
+                        if p["mcp"]:
+                            bits.append("mcp")
+                        print(f"  {CYAN}{p['name']}{R} {DIM}{p['version']} "
+                              f"{'· '.join(bits)} — {p['description']}{R}")
+                    print()
             continue
         if cmd == "/diff":
             inrepo = subprocess.run("git rev-parse --is-inside-work-tree",
@@ -5193,6 +5598,10 @@ def _repl(messages, spinner):
                      "readwrite": "edit", "read+write": "edit", "everything": "all", "yolo": "all"}
             mode = alias.get(arg, arg)
             if mode in _AUTO_LEVELS:
+                capped = _managed_cap_auto_mode(mode)
+                if capped != mode:
+                    print(f"\n{YELL}managed policy caps auto mode at {capped}.{R}")
+                mode = capped
                 globals()["AUTO_MODE"] = mode
                 _save_auto_mode(mode)
                 blurb = {"read": "auto-approve reads only — writes/commands will prompt",

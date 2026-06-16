@@ -14,7 +14,29 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.14`.
+- **Version:** `0.8.17`.
+- **Enterprise managed policy** — `/etc/hera/managed-policy.json` (or `HERA_MANAGED_POLICY`):
+  admin-controlled, overrides user config, can't be loosened. `permissions` checked before user
+  rules in `_perm_decision`; `disable_bypass` forces YOLO off; `max_auto_mode` caps `/auto`
+  (`_managed_cap_auto_mode`).
+- **OpenTelemetry-style telemetry** — `_emit_telemetry` writes events (session_start/end,
+  request token usage, tool calls) to a JSONL file (`HERA_TELEMETRY_LOG`) and/or an OTLP/HTTP
+  logs endpoint (`HERA_OTEL_ENDPOINT`, `_otlp_log`). Off unless a sink is configured; best-effort.
+- **Note on remaining Claude-Code gaps:** the rest are separate products/infra, not CLI code —
+  other clients (JetBrains/desktop/web; all can drive `hera --serve`), the GitHub App + hosted
+  multi-agent review, and the *hosted* marketplace. Billing intentionally out of scope.
+- **Plugins & marketplaces (local, directory-based)** — `~/.config/hera/plugins/<name>/` bundles
+  `commands/*.md`, `agents/*.md`, `mcp.json`, and a `plugin.json` (name/version/enabled).
+  `load_plugins()` merges them into the command/agent registries (called first in
+  `register_extensions`); `register_mcp` now loads each plugin's `mcp.json` too. Marketplaces are
+  `~/.config/hera/marketplaces/*.json` indexes (`marketplace_catalog`); `install_plugin` copies a
+  local path or `git clone`s a URL. `/plugins`, `/plugins marketplace`, `/plugins install <name>`.
+- **Multi-provider backends** — `HERA_PROVIDER`: `openai` (default; any OpenAI-compatible
+  endpoint) or `anthropic`/`bedrock`/`vertex` (native Anthropic Messages API). Pure-function
+  translators `_to_anthropic_messages` (tool_calls↔tool_use, tool results↔tool_result, image
+  parts, role-merging) and `_parse_anthropic_response`; `_anthropic_headers` selects auth
+  (x-api-key / Bearer). Dispatched from `stream_turn` and `_serve_stream` (non-streaming for the
+  Anthropic path). Bedrock needs SigV4 (front with a proxy) — Vertex uses a GCP bearer token.
 - **Hooks & UX depth (Claude-Code parity, group 4/4):**
   - **More hook events** — `_run_hooks` now also fires `UserPromptSubmit`, `SessionStart`,
     `SessionEnd`, `PreCompact`, `SubagentStop`, `Notification`. `UserPromptSubmit` can veto a

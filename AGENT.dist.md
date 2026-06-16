@@ -14,7 +14,44 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.17`.
+- **Version:** `0.8.25`.
+- **Interactive MCP OAuth (auth-code + PKCE)** — `/mcp login <server>` or `hera mcp-login <server>`:
+  `_pkce_pair` (S256), `_oauth_authorize_url`, RFC 8414 `_discover_oauth_endpoints`, a localhost
+  callback, then token exchange; `_save_mcp_token` writes the token to mcp.json (used by
+  `_mcp_headers`). Endpoints from the server's `oauth` block or discovery. NOTE: the live
+  browser/exchange flow is best-effort and **not** covered by tests (no OAuth server here); the
+  PKCE/URL/discovery/token-save units are tested.
+- **Pluggable web search** — `HERA_SEARCH_PROVIDER`: `duckduckgo` (default, keyless) or higher-
+  quality `tavily` / `brave` / `searxng` (`HERA_SEARCH_KEY`/`HERA_SEARCH_URL`). Providers return
+  `{title,url,snippet}` via `_format_results`; non-DDG providers fall back to DDG on error.
+- **Thinking keywords + `max`** — saying "ultrathink" / "think hard(er)" / "think deeply" in a
+  prompt bumps that turn's thinking (`_keyword_think_level` → `_TURN_THINK`, wins over
+  `THINK_LEVEL`); `/think` gains a `max` level.
+- **Sub-agent per-model selection** — `stream_turn(..., model_override=)` threads a model id
+  through; `run_subagent`/`tool_task` resolve it from the task `model` arg or a named agent's
+  `model:` frontmatter (`_agent_model`). Lets a sub-agent run on a different model/provider.
+  (Parallel/background sub-agents remain deferred — shared-stdout live streaming makes clean
+  concurrent output non-trivial; would need a threadlocal-quiet refactor.)
+- **OTel metrics signal** — alongside the event logs, `_emit_metric`/`_otlp_metric` emit counters
+  (`hera.tokens`, `hera.requests`, `hera.tool.calls`, `hera.sessions`) to the JSONL sink and/or
+  an OTLP/HTTP `/v1/metrics` endpoint. Same `HERA_TELEMETRY_LOG`/`HERA_OTEL_ENDPOINT` switches.
+- **Interactive management commands** — `/agents` (list named sub-agents + their tool scopes),
+  `/mcp` (connected MCP servers + tool counts), `/permissions` (list managed+user rules, or add
+  one live: `/permissions deny run_bash(rm *)` via `add_permission`, persisted), `/config`
+  (effective settings summary via `_config_summary`).
+- **Multi-directory access (`--add-dir`)** — grant the session trusted dirs beyond cwd. CLI
+  `--add-dir DIR` (repeatable), `HERA_ADD_DIR` (`:`/`,`-sep), config `add_dirs`, and `/add-dir`.
+  `EXTRA_DIRS` are bind-mounted writable into the run_bash sandbox (`_extra_binds`) and announced
+  in the system prompt; `sandbox_label` shows the count.
+- **`/init`** — analyzes the repo (via the agent's own read/glob/search tools) and writes a
+  concise `HERA.md` project-context file (`_init_prompt`, seeded with `_detect_project_commands`).
+- **`/export [path]`** — dumps the conversation to Markdown (default) or JSON (`.json` path);
+  `export_conversation` excludes the system prompt and records tool calls.
+- **Headless print mode (`-p`)** — `hera -p "prompt"` (or piped stdin) runs one agentic task
+  non-interactively and exits. `--output-format text|json|stream-json`, `--max-turns`, `--yolo`.
+  `print_main` reuses `_serve_run` with a swappable `_EMIT_SINK` (`_default_emit`) to capture
+  events; `_NONINTERACTIVE` auto-denies tools that would need a prompt (use `--yolo`/auto mode).
+  Enables scripting/automation/cron. (`main()` now dispatches `-p` before the REPL.)
 - **Enterprise managed policy** — `/etc/hera/managed-policy.json` (or `HERA_MANAGED_POLICY`):
   admin-controlled, overrides user config, can't be loosened. `permissions` checked before user
   rules in `_perm_decision`; `disable_bypass` forces YOLO off; `max_auto_mode` caps `/auto`

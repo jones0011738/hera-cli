@@ -153,7 +153,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.17"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.25"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -209,6 +209,12 @@ MAX_IMAGE_BYTES = 10_000_000  # cap an attached image before base64 (≈13MB enc
 WEB_ENABLED = not _truthy(_env("HERA_NO_WEB"))      # on by default; HERA_NO_WEB=1 disables
 WEB_TIMEOUT = int(_env("HERA_WEB_TIMEOUT", default="20"))
 _WEB_UA = f"Mozilla/5.0 (X11; Linux x86_64) HeraCLI/{VERSION}"
+# Web search provider: duckduckgo (default, keyless HTML scrape) or a higher-
+# quality API — tavily / brave / searxng — via HERA_SEARCH_KEY / HERA_SEARCH_URL.
+SEARCH_PROVIDER = (_cfg("HERA_SEARCH_PROVIDER", key="search_provider",
+                        default="duckduckgo") or "duckduckgo").lower()
+SEARCH_KEY = _cfg("HERA_SEARCH_KEY", key="search_key", default="")
+SEARCH_URL = _cfg("HERA_SEARCH_URL", key="search_url", default="").rstrip("/")
 
 # Offer to install a missing program rather than just failing a run_bash call.
 AUTO_INSTALL = not _truthy(_env("HERA_NO_AUTOINSTALL"))
@@ -326,6 +332,45 @@ def _emit_telemetry(event, **attrs):
             requests.post(f"{OTEL_ENDPOINT}/v1/logs", json=_otlp_log(event, rec),
                           timeout=3)
         except Exception:  # noqa: BLE001 — telemetry must never break a turn
+            pass
+
+
+def _otlp_metric(name, value, attrs, monotonic=True):
+    """Minimal OTLP/HTTP metrics payload for one cumulative-sum data point."""
+    point = {
+        "asDouble": float(value),
+        "timeUnixNano": int(time.time() * 1e9),
+        "attributes": [{"key": k, "value": {"stringValue": str(v)}} for k, v in attrs.items()],
+    }
+    return {"resourceMetrics": [{
+        "resource": {"attributes": [
+            {"key": "service.name", "value": {"stringValue": "hera"}},
+            {"key": "service.version", "value": {"stringValue": VERSION}}]},
+        "scopeMetrics": [{"metrics": [{
+            "name": name,
+            "sum": {"dataPoints": [point], "aggregationTemporality": 2,
+                    "isMonotonic": monotonic}}]}]}]}
+
+
+def _emit_metric(name, value, **attrs):
+    """Emit a counter metric to the telemetry sinks (JSONL and/or OTLP metrics).
+    The metrics signal complements the event logs from _emit_telemetry."""
+    if not TELEMETRY_ON:
+        return
+    rec = {"ts": time.time(), "metric": name, "value": value,
+           "session": CURRENT_SESSION.get("id"), "model": MODEL, **attrs}
+    if TELEMETRY_LOG:
+        try:
+            with _TELEMETRY_LOCK, open(os.path.expanduser(TELEMETRY_LOG), "a",
+                                       encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except OSError:
+            pass
+    if OTEL_ENDPOINT:
+        try:
+            requests.post(f"{OTEL_ENDPOINT}/v1/metrics",
+                          json=_otlp_metric(name, value, {**attrs, "model": MODEL}), timeout=3)
+        except Exception:  # noqa: BLE001
             pass
 
 # Plan mode: read-only investigation; mutating tools are blocked until the user
@@ -611,11 +656,49 @@ def _detect_sandbox():
 
 SANDBOX_KIND = _detect_sandbox()
 
+# Additional trusted directories beyond cwd (Claude-Code `--add-dir`): readable
+# by the file tools and bind-mounted writable into the run_bash sandbox.
+def _initial_extra_dirs():
+    raw = _env("HERA_ADD_DIR", default="")
+    dirs = [d for d in re.split(r"[:,]", raw) if d.strip()]
+    cfg = _FILE_CFG.get("add_dirs")
+    if isinstance(cfg, list):
+        dirs += [str(d) for d in cfg]
+    out = []
+    for d in dirs:
+        p = os.path.realpath(os.path.expanduser(d.strip()))
+        if os.path.isdir(p) and p not in out:
+            out.append(p)
+    return out
+
+
+EXTRA_DIRS = _initial_extra_dirs()
+
+
+def _extra_binds():
+    """bwrap --bind args for each extra trusted dir (writable)."""
+    args = []
+    for d in EXTRA_DIRS:
+        if os.path.isdir(d):
+            args += ["--bind", d, d]
+    return args
+
+
+def add_extra_dir(path):
+    """Grant the session access to an extra directory (run_bash sandbox + tools)."""
+    p = os.path.realpath(os.path.expanduser((path or "").strip()))
+    if not os.path.isdir(p):
+        return f"[error] not a directory: {p}"
+    if p not in EXTRA_DIRS:
+        EXTRA_DIRS.append(p)
+    return f"added trusted dir: {p}  ({len(EXTRA_DIRS)} total)"
+
 
 def sandbox_label():
     net = "network on" if SANDBOX_NET else "no network"
+    extra = f" (+{len(EXTRA_DIRS)} added dir(s))" if EXTRA_DIRS else ""
     if SANDBOX_KIND == "bwrap":
-        return f"bwrap — fs confined to cwd, {net}"
+        return f"bwrap — fs confined to cwd{extra}, {net}"
     if SANDBOX_KIND == "unshare":
         return f"unshare — pid-isolated, {net} (install bubblewrap for fs confinement)"
     return "none — run_bash runs unconfined"
@@ -629,7 +712,7 @@ def _sandbox_argv(command):
         # private /tmp, then bind the working dir writable LAST so it stays
         # writable even when cwd is itself under /tmp.
         argv = ["bwrap", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
-                "--tmpfs", "/tmp", "--bind", cwd, cwd,
+                "--tmpfs", "/tmp", "--bind", cwd, cwd, *_extra_binds(),
                 "--die-with-parent", "--chdir", cwd]
         if not SANDBOX_NET:
             argv += ["--unshare-net"]
@@ -650,7 +733,8 @@ def _sandbox_wrap_argv(argv):
     cwd = os.getcwd()
     if SANDBOX_KIND == "bwrap":
         pre = ["bwrap", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
-               "--tmpfs", "/tmp", "--bind", cwd, cwd, "--die-with-parent", "--chdir", cwd]
+               "--tmpfs", "/tmp", "--bind", cwd, cwd, *_extra_binds(),
+               "--die-with-parent", "--chdir", cwd]
         if not SANDBOX_NET:
             pre += ["--unshare-net"]
         return pre + ["--"] + list(argv)
@@ -1379,25 +1463,77 @@ def _ddg_url(href):
     return href
 
 
-def tool_web_search(query, max_results=6):
-    """Search the web (DuckDuckGo) and return ranked title/url/snippet results."""
-    try:
-        resp = requests.post("https://html.duckduckgo.com/html/",
-                             data={"q": query}, headers={"User-Agent": _WEB_UA},
-                             timeout=WEB_TIMEOUT)
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-        return f"[error] web search failed: {exc}"
+def _format_results(items, max_results):
+    """Format a list of {title,url,snippet} dicts into the ranked text block."""
+    out = []
+    for i, it in enumerate(items[:max_results]):
+        out.append(f"{i + 1}. {(it.get('title') or '').strip()}\n"
+                   f"   {it.get('url', '')}\n   {(it.get('snippet') or '').strip()}")
+    return "\n".join(out) if out else "(no results found)"
+
+
+def _search_duckduckgo(query, n):
+    resp = requests.post("https://html.duckduckgo.com/html/", data={"q": query},
+                         headers={"User-Agent": _WEB_UA}, timeout=WEB_TIMEOUT)
+    resp.raise_for_status()
     body = resp.text
     titles = re.findall(r'class="result__a"[^>]*href="(.*?)"[^>]*>(.*?)</a>', body, re.S)
     snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', body, re.S)
-    results = []
-    for i, (href, title) in enumerate(titles[:max_results]):
-        snip = _html_text(snippets[i]) if i < len(snippets) else ""
-        results.append(f"{i + 1}. {_html_text(title)}\n   {_ddg_url(href)}\n   {snip}")
-    if not results:
-        return "(no results found)"
-    return "\n".join(results)
+    items = []
+    for i, (href, title) in enumerate(titles[:n]):
+        items.append({"title": _html_text(title), "url": _ddg_url(href),
+                      "snippet": _html_text(snippets[i]) if i < len(snippets) else ""})
+    return items
+
+
+def _search_tavily(query, n):
+    r = requests.post("https://api.tavily.com/search",
+                      json={"api_key": SEARCH_KEY, "query": query, "max_results": n},
+                      timeout=WEB_TIMEOUT)
+    r.raise_for_status()
+    return [{"title": x.get("title"), "url": x.get("url"), "snippet": x.get("content")}
+            for x in (r.json().get("results") or [])]
+
+
+def _search_brave(query, n):
+    r = requests.get("https://api.search.brave.com/res/v1/web/search",
+                     params={"q": query, "count": n},
+                     headers={"X-Subscription-Token": SEARCH_KEY,
+                              "Accept": "application/json"}, timeout=WEB_TIMEOUT)
+    r.raise_for_status()
+    web = (r.json().get("web") or {}).get("results") or []
+    return [{"title": x.get("title"), "url": x.get("url"), "snippet": x.get("description")}
+            for x in web]
+
+
+def _search_searxng(query, n):
+    base = SEARCH_URL or "http://localhost:8888"
+    r = requests.get(f"{base}/search", params={"q": query, "format": "json"},
+                     headers={"User-Agent": _WEB_UA}, timeout=WEB_TIMEOUT)
+    r.raise_for_status()
+    return [{"title": x.get("title"), "url": x.get("url"), "snippet": x.get("content")}
+            for x in (r.json().get("results") or [])[:n]]
+
+
+_SEARCH_PROVIDERS = {"duckduckgo": _search_duckduckgo, "tavily": _search_tavily,
+                     "brave": _search_brave, "searxng": _search_searxng}
+
+
+def tool_web_search(query, max_results=6):
+    """Search the web and return ranked title/url/snippet results. Uses the
+    configured provider (default DuckDuckGo); falls back to DuckDuckGo on error."""
+    provider = _SEARCH_PROVIDERS.get(SEARCH_PROVIDER, _search_duckduckgo)
+    try:
+        items = provider(query, max_results)
+    except requests.exceptions.RequestException as exc:
+        if provider is not _search_duckduckgo:
+            try:
+                items = _search_duckduckgo(query, max_results)
+            except requests.exceptions.RequestException as exc2:
+                return f"[error] web search failed: {exc2}"
+        else:
+            return f"[error] web search failed: {exc}"
+    return _format_results(items, max_results)
 
 
 def tool_web_fetch(url, max_chars=9000):
@@ -2030,13 +2166,13 @@ def _anthropic_headers():
                             "Content-Type": "application/json"}
 
 
-def _anthropic_turn(messages, spinner, tools=None):
+def _anthropic_turn(messages, spinner, tools=None, model_override=None):
     """One turn against the Anthropic Messages API. Non-streaming for robustness;
     prints the answer once it arrives. Returns the internal turn dict or None."""
     base, headers = _anthropic_headers()
     system, amsgs = _to_anthropic_messages(messages)
     schemas = tools if tools is not None else TOOL_SCHEMAS
-    body = {"model": MODEL, "max_tokens": MAX_OUTPUT_TOKENS, "messages": amsgs,
+    body = {"model": model_override or MODEL, "max_tokens": MAX_OUTPUT_TOKENS, "messages": amsgs,
             "tools": _anthropic_tools(schemas)}
     if system:
         body["system"] = system
@@ -2058,18 +2194,21 @@ def _anthropic_turn(messages, spinner, tools=None):
     return result
 
 
-def stream_turn(messages, spinner, tools=None):
+def stream_turn(messages, spinner, tools=None, model_override=None):
     """One model turn. Streams reasoning + content live; assembles tool calls.
+    `model_override` (e.g. from a sub-agent definition) selects a different model.
 
     Returns dict {content, finish_reason, tool_calls, usage} or None on error.
     """
     if _is_anthropic():
-        return _anthropic_turn(messages, spinner, tools)
+        return _anthropic_turn(messages, spinner, tools, model_override)
     # Transient blips (server busy under --parallel load, a dropped connection)
     # return 5xx/connection errors. Retry a few times with backoff before giving
     # up, so one hiccup doesn't end the turn.
     global _VISION_WARNED
     url, model, send_messages, downgraded = _select_endpoint(messages)
+    if model_override:
+        model = model_override
     if downgraded and not _VISION_WARNED:
         _VISION_WARNED = True
         spinner.stop()
@@ -2114,6 +2253,8 @@ def stream_turn(messages, spinner, tools=None):
                       file=sys.stderr)
                 compact_history(messages)
                 url, model, send_messages, downgraded = _select_endpoint(messages)
+                if model_override:
+                    model = model_override
                 compacted = True
                 spinner.start()
                 continue  # doesn't count as a failed attempt
@@ -2259,6 +2400,8 @@ def _account(usage):
     SESSION["total"]      += t
     SESSION["requests"]   += 1
     _emit_telemetry("request", prompt_tokens=p, completion_tokens=c, total_tokens=t)
+    _emit_metric("hera.tokens", t, kind="total")
+    _emit_metric("hera.requests", 1)
     return t
 
 
@@ -2407,6 +2550,7 @@ def run_agent(messages, spinner):
     # Did the user ask for a code change? Then if the model only *talks* about
     # the fix and never edits, nudge it once to actually apply it.
     change_requested = _wants_code_change(last_user)
+    globals()["_TURN_THINK"] = _keyword_think_level(last_user)
     _maybe_auto_compact(messages)
     for step in range(MAX_STEPS):
         spinner.start()
@@ -2664,6 +2808,7 @@ def _exec_call(c, indent=""):
         print(_render_todos_text())
     _run_hooks("PostToolUse", name, args, output)
     _emit_telemetry("tool", tool=name, error=is_err)
+    _emit_metric("hera.tool.calls", 1, tool=name, error=is_err)
 
     if len(output) > MAX_TOOL_OUTPUT:
         output = output[:MAX_TOOL_OUTPUT] + f"\n…[truncated, {len(output)} chars total]"
@@ -2671,20 +2816,31 @@ def _exec_call(c, indent=""):
 
 
 # ── Sub-agents / task delegation ──────────────────────────────────────────────
-def run_subagent(description, agent=None):
+def _agent_model(agent):
+    """The model a named agent prefers (its `model:` frontmatter), or None."""
+    if agent and agent in CUSTOM_AGENTS:
+        meta, _ = _parse_frontmatter(CUSTOM_AGENTS[agent])
+        m = (meta.get("model") or "").strip()
+        return m or None
+    return None
+
+
+def run_subagent(description, agent=None, model=None):
     """Run a focused nested agent on `description`; return its final answer text.
 
     The sub-agent has every tool except `task` itself (so it can't recurse),
     shares the approval gate / sandbox / checkpoints, and reports indented
     progress. Only its final summary goes back to the parent. A named agent
     definition (from ~/.config/hera/agents/<name>.md) can supply its own system
-    prompt and restrict the tool set via a `tools:` frontmatter list.
+    prompt, restrict the tool set via a `tools:` frontmatter list, and pick a
+    different `model:` (overridable per call via the task tool's `model` arg).
     """
     sub_schemas = [s for s in TOOL_SCHEMAS if s["function"]["name"] != "task"]
     sys_prompt = (f"You are a focused sub-agent of {NAME}. Complete the delegated task using your "
                   f"tools in {os.getcwd()}, then reply with a concise summary of what you found or "
                   f"changed. Be thorough but terse.")
     label = "sub-agent"
+    sub_model = model or _agent_model(agent)
     if agent and agent in CUSTOM_AGENTS:
         meta, body = _parse_frontmatter(CUSTOM_AGENTS[agent])
         if body.strip():
@@ -2698,11 +2854,12 @@ def run_subagent(description, agent=None):
         {"role": "user", "content": description},
     ]
     spinner = Spinner()
-    print(f"\n  {BLUE}⤷ {label} started{R} {DIM}{description[:70]}{R}")
+    tag = f"{label}" + (f" ({sub_model})" if sub_model else "")
+    print(f"\n  {BLUE}⤷ {tag} started{R} {DIM}{description[:70]}{R}")
     final = ""
     for _ in range(MAX_STEPS):
         spinner.start()
-        res = stream_turn(msgs, spinner, tools=sub_schemas)
+        res = stream_turn(msgs, spinner, tools=sub_schemas, model_override=sub_model)
         if res is None:
             return "[sub-agent error] transport failure"
         _account(res.get("usage"))
@@ -2725,8 +2882,8 @@ def run_subagent(description, agent=None):
     return final or "(sub-agent produced no result)"
 
 
-def tool_task(description, agent=None, **_ignored):
-    return run_subagent(description, agent=agent)
+def tool_task(description, agent=None, model=None, **_ignored):
+    return run_subagent(description, agent=agent, model=model)
 
 
 TOOLS["task"] = tool_task
@@ -2740,6 +2897,7 @@ TOOL_SCHEMAS.append({"type": "function", "function": {
     "parameters": {"type": "object", "properties": {
         "description": {"type": "string", "description": "The subtask, with enough context to act on"},
         "agent": {"type": "string", "description": "Optional named agent to use"},
+        "model": {"type": "string", "description": "Optional model id to run this sub-agent on"},
     }, "required": ["description"]},
 }})
 
@@ -3783,6 +3941,141 @@ def register_mcp():
     return loaded
 
 
+# ── MCP OAuth (authorization-code + PKCE) ─────────────────────────────────────
+def _pkce_pair():
+    """Return (verifier, S256 challenge) for OAuth 2.0 PKCE (RFC 7636)."""
+    import secrets
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _oauth_authorize_url(auth_endpoint, client_id, redirect_uri, challenge, scope="", state=""):
+    params = {"response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri,
+              "code_challenge": challenge, "code_challenge_method": "S256"}
+    if scope:
+        params["scope"] = scope
+    if state:
+        params["state"] = state
+    sep = "&" if "?" in auth_endpoint else "?"
+    return auth_endpoint + sep + _urlparse.urlencode(params)
+
+
+def _discover_oauth_endpoints(server_url):
+    """Find a server's OAuth endpoints via RFC 8414 / OIDC well-known metadata."""
+    parts = _urlparse.urlsplit(server_url)
+    base = f"{parts.scheme}://{parts.netloc}"
+    for path in ("/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"):
+        try:
+            r = requests.get(base + path, timeout=10)
+            r.raise_for_status()
+            d = r.json()
+            if d.get("authorization_endpoint") and d.get("token_endpoint"):
+                return {"authorization_endpoint": d["authorization_endpoint"],
+                        "token_endpoint": d["token_endpoint"],
+                        "scopes_supported": d.get("scopes_supported", [])}
+        except Exception:  # noqa: BLE001 — try the next well-known path
+            continue
+    return {}
+
+
+def _save_mcp_token(name, token):
+    """Persist an obtained OAuth token onto the MCP server entry in mcp.json."""
+    if not os.path.isfile(MCP_CONFIG):
+        return False
+    try:
+        with open(MCP_CONFIG, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    servers = cfg.get("mcpServers", cfg if isinstance(cfg, dict) else {})
+    if name not in servers or not isinstance(servers[name], dict):
+        return False
+    servers[name]["token"] = token
+    try:
+        with open(MCP_CONFIG, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def mcp_oauth_login(name):
+    """Interactive OAuth 2.0 (auth-code + PKCE) for an HTTP MCP server, saving the
+    token to mcp.json. Endpoints come from the server's `oauth` block or RFC 8414
+    discovery. NOTE: the live browser + token-exchange flow is best-effort and is
+    not exercised by the test suite (no OAuth server available here)."""
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    if not name:
+        return "[error] usage: /mcp login <server>"
+    if not os.path.isfile(MCP_CONFIG):
+        return f"[error] no {MCP_CONFIG}"
+    try:
+        with open(MCP_CONFIG, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"[error] bad mcp.json: {exc}"
+    servers = cfg.get("mcpServers", cfg if isinstance(cfg, dict) else {})
+    spec = servers.get(name)
+    if not isinstance(spec, dict) or not spec.get("url"):
+        return f"[error] no HTTP MCP server named {name!r}"
+    oauth = spec.get("oauth") or {}
+    eps = {"authorization_endpoint": oauth.get("authorization_endpoint"),
+           "token_endpoint": oauth.get("token_endpoint")}
+    if not (eps["authorization_endpoint"] and eps["token_endpoint"]):
+        eps = _discover_oauth_endpoints(spec["url"]) or eps
+    if not (eps.get("authorization_endpoint") and eps.get("token_endpoint")):
+        return ("[error] couldn't find OAuth endpoints — set oauth.authorization_endpoint "
+                "and oauth.token_endpoint in mcp.json")
+    client_id = oauth.get("client_id") or "hera"
+    scope = oauth.get("scope") or " ".join(eps.get("scopes_supported") or [])
+    verifier, challenge = _pkce_pair()
+    holder = {}
+
+    class _CB(BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = _urlparse.parse_qs(_urlparse.urlsplit(self.path).query)
+            holder["code"] = (q.get("code") or [None])[0]
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Hera: authorization received. You can close this tab.")
+
+        def log_message(self, *a):
+            pass
+
+    httpd = HTTPServer(("127.0.0.1", 0), _CB)
+    redirect = f"http://127.0.0.1:{httpd.server_address[1]}/callback"
+    url = _oauth_authorize_url(eps["authorization_endpoint"], client_id, redirect, challenge, scope)
+    print(f"\n  Opening your browser to authorize '{name}'…\n  {url}\n")
+    try:
+        webbrowser.open(url)
+    except Exception:  # noqa: BLE001
+        pass
+    threading.Thread(target=httpd.handle_request, daemon=True).start()
+    for _ in range(240):  # ~120s
+        if holder.get("code"):
+            break
+        time.sleep(0.5)
+    httpd.server_close()
+    code = holder.get("code")
+    if not code:
+        return "[error] no authorization code received (timed out)"
+    try:
+        r = requests.post(eps["token_endpoint"], data={
+            "grant_type": "authorization_code", "code": code, "redirect_uri": redirect,
+            "client_id": client_id, "code_verifier": verifier}, timeout=30)
+        r.raise_for_status()
+        token = r.json().get("access_token")
+    except Exception as exc:  # noqa: BLE001
+        return f"[error] token exchange failed: {exc}"
+    if not token:
+        return "[error] no access_token in the response"
+    _save_mcp_token(name, token)
+    return f"authorized '{name}' — token saved to {MCP_CONFIG} (reload to use it)"
+
+
 def register_custom_tools():
     loaded = []
     for i, path in enumerate(CUSTOM_TOOLS_PATHS):
@@ -3970,11 +4263,108 @@ def memory_report():
           f"edit a file directly{R}\n")
 
 
+def _init_prompt():
+    """Instruction for `/init`: have the agent analyze the repo and write HERA.md."""
+    cmds = _detect_project_commands()
+    hint = (" Detected toolchain: " + ", ".join(cmds) + ".") if cmds else ""
+    return ("Analyze this project and create a concise HERA.md at the repo root that future Hera "
+            "sessions load as context. Use glob/search/read_file to inspect the structure, key "
+            "entry points, build/test/run commands, conventions, and any gotchas. Keep it under "
+            "~150 skimmable lines with short sections (Overview, Layout, Build/Test/Run, "
+            "Conventions). Write it with write_file, then stop." + hint)
+
+
+def export_conversation(messages, path=None):
+    """`/export`: write the conversation to Markdown (default) or JSON (.json path)."""
+    if not path:
+        path = os.path.join(os.getcwd(), f"hera-conversation-{time.strftime('%Y%m%d-%H%M%S')}.md")
+    path = _resolve(path)
+    if path.endswith(".json"):
+        data = [m for m in messages if m.get("role") != "system"]
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError as exc:
+            return f"[error] {exc}"
+        return f"exported {len(data)} messages → {path}"
+    lines = [f"# Hera conversation — {time.strftime('%Y-%m-%d %H:%M')}"]
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            continue
+        c = _text_of(m.get("content"))
+        if role == "user":
+            lines.append(f"\n## You\n\n{c}")
+        elif role == "assistant":
+            if c.strip():
+                lines.append(f"\n## Hera\n\n{c}")
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function", {})
+                lines.append(f"\n> 🔧 `{fn.get('name')}` {str(fn.get('arguments', ''))[:300]}")
+        elif role == "tool":
+            lines.append(f"\n> ⎿ {c[:500]}")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as exc:
+        return f"[error] {exc}"
+    return f"exported → {path}"
+
+
+def add_permission(bucket, rule):
+    """Add a live permission rule (deny/ask/allow) and persist it. Powers
+    `/permissions <bucket> <rule>`."""
+    if bucket not in ("deny", "ask", "allow"):
+        return "[error] bucket must be deny, ask, or allow"
+    rule = (rule or "").strip()
+    if not rule:
+        return "[error] empty rule (e.g. run_bash(rm *) or edit_file(src/**))"
+    perms = dict(_PERMS) if isinstance(_PERMS, dict) else {}
+    lst = list(perms.get(bucket) or [])
+    if rule not in lst:
+        lst.append(rule)
+    perms[bucket] = lst
+    globals()["_PERMS"] = perms
+    save_config({"permissions": perms})
+    return f"added {bucket} rule: {rule}  ({len(lst)} {bucket} total)"
+
+
+def _config_summary():
+    """Key effective settings (for `/config`)."""
+    return {
+        "provider": PROVIDER,
+        "model": MODEL,
+        "api_url": API_URL or "(unset)",
+        "auto_mode": AUTO_MODE,
+        "plan_mode": PLAN_MODE,
+        "think": THINK_LEVEL,
+        "output_style": OUTPUT_STYLE,
+        "web": WEB_ENABLED,
+        "auto_verify": AUTO_VERIFY,
+        "telemetry": "on" if TELEMETRY_ON else "off",
+        "sandbox": sandbox_label(),
+        "config_path": CONFIG_PATH,
+    }
+
+
+# A per-turn override set from in-prompt keywords ("think hard", "ultrathink").
+_TURN_THINK = None
+_THINK_KEYWORD_RE = re.compile(
+    r"\b(ultrathink|think (?:hard(?:er)?|deeply|step by step|carefully))\b", re.IGNORECASE)
+
+
+def _keyword_think_level(text):
+    """Map in-prompt thinking keywords to a level for this turn, or None."""
+    return "hard" if _THINK_KEYWORD_RE.search(text or "") else None
+
+
 def _think_payload():
-    """Extra request fields for the active thinking level (off|normal|hard)."""
-    if THINK_LEVEL == "off":
+    """Extra request fields for the effective thinking level. A per-turn keyword
+    override (_TURN_THINK) wins over the configured THINK_LEVEL. off|normal|hard|max."""
+    level = _TURN_THINK or THINK_LEVEL
+    if level == "off":
         return {"chat_template_kwargs": {"enable_thinking": False}}
-    if THINK_LEVEL == "hard":
+    if level in ("hard", "max"):
         return {"chat_template_kwargs": {"enable_thinking": True}}
     return {}  # 'normal' → leave the server default
 
@@ -4019,6 +4409,9 @@ def system_prompt():
     base += (" For any task with more than ~3 steps, call todo_write first to lay out the plan as "
              "a checklist, then update it as you go — mark each step completed and set the next one "
              "in_progress, keeping exactly one in_progress at a time. Skip it for trivial requests.")
+    if EXTRA_DIRS:
+        base += (" You may also read and write files in these additional trusted directories: "
+                 + ", ".join(EXTRA_DIRS) + ".")
     if AUTO_VERIFY and not PLAN_MODE:
         base += (" ALWAYS VERIFY YOUR WORK: after writing or modifying code, actually run it before "
                  "saying you're done — run the project's tests/build/linter if present, or otherwise "
@@ -4258,6 +4651,8 @@ SLASH_COMMANDS = [
     ("/rewind",    "[n]",       "restore conversation AND files to an earlier turn"),
     ("/context",   "",          "show how the context window is being used"),
     ("/memory",    "",          "show loaded memory files (add with # <fact>)"),
+    ("/init",      "",          "analyze the project and generate a HERA.md"),
+    ("/export",    "[path]",    "save the conversation to Markdown (or .json)"),
     ("/plugins",   "[install]", "list plugins, browse the marketplace, or install one"),
     ("/diff",      "",          "show the working-tree git diff"),
     ("/compact",   "",          "summarize the conversation to free up context"),
@@ -4268,6 +4663,11 @@ SLASH_COMMANDS = [
     ("/tools",     "",          "list the tools I can use"),
     ("/allow",     "[pattern]", "list run_bash allow patterns, or add one"),
     ("/sandbox",   "",          "show the run_bash sandbox status"),
+    ("/add-dir",   "[path]",    "grant access to an extra directory beyond cwd"),
+    ("/agents",    "",          "list named sub-agents"),
+    ("/mcp",       "",          "list connected MCP servers"),
+    ("/permissions", "[rule]",  "list permission rules, or add one (deny/ask/allow)"),
+    ("/config",    "",          "show effective settings"),
     ("/sessions",  "",          "list saved conversations (by their first message)"),
     ("/resume",    "",          "pick a past conversation to resume (by its first message)"),
     ("/reasoning", "",          "toggle streaming of my thinking"),
@@ -4640,9 +5040,21 @@ _APPROVAL_Q = queue.Queue()
 _SERVE_CLOSED = threading.Event()
 
 
-def _emit(obj):
+def _default_emit(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
+
+
+# Swappable so headless `-p` (print) mode can capture events instead of writing
+# the raw serve JSON stream. serve mode uses the default sink.
+_EMIT_SINK = _default_emit
+# When True (headless -p without a TTY), tool approvals can't prompt — they're
+# auto-denied unless YOLO / auto-mode / allowlist already granted them.
+_NONINTERACTIVE = False
+
+
+def _emit(obj):
+    _EMIT_SINK(obj)
 
 
 # NOTE: stdin is consumed exclusively by _serve_input_thread below — nothing in
@@ -4822,6 +5234,9 @@ def _serve_approve(name, args):
             return True
     if name == "run_bash" and decision != "ask" and bash_allowed(args.get("command", "")):
         return True
+    if _NONINTERACTIVE:  # headless -p: nothing to prompt, so deny safely
+        return (f"requires approval ({name}); run with --yolo or set auto mode "
+                f"to allow it in headless mode")
     _emit({"type": "approval_request", "name": name,
            "preview": _strip_ansi(_preview_call(name, args)),
            "command": args.get("command", "")})
@@ -4941,6 +5356,7 @@ def _serve_run(messages):
                       if m.get("role") == "user"), "")
     verify_requested = _wants_run_verification(last_user)
     change_requested = _wants_code_change(last_user)
+    globals()["_TURN_THINK"] = _keyword_think_level(last_user)
     _maybe_auto_compact(messages, emit=_emit)
     for _ in range(MAX_STEPS):
         res = _serve_stream(messages)
@@ -5010,6 +5426,84 @@ def _serve_run(messages):
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": out})
     _emit({"type": "turn_end", "content": "[stopped: hit MAX_STEPS]",
            "turn_tokens": turn, "session_tokens": dict(SESSION)})
+
+
+def print_main(prompt_text, output_format="text", max_turns=None):
+    """Headless one-shot run (Claude-Code `-p`). Reads `prompt_text` (or stdin),
+    runs a single agentic task non-interactively, and prints the result in
+    `output_format`: text (final answer), json (one result object), or
+    stream-json (one JSON event per line). Returns a process exit code."""
+    global _EMIT_SINK, _NONINTERACTIVE, _PLAN_APPROVER
+    if not API_URL:
+        print("[error] no endpoint set — export HERA_API_URL / HERA_API_KEY", file=sys.stderr)
+        return 1
+    if not prompt_text and not sys.stdin.isatty():
+        prompt_text = sys.stdin.read()
+    prompt_text = (prompt_text or "").strip()
+    if not prompt_text:
+        print("[error] no prompt — pass -p \"...\" or pipe text on stdin", file=sys.stderr)
+        return 1
+
+    resolve_identity()
+    register_extensions(quiet=True)
+    if max_turns:
+        globals()["MAX_STEPS"] = int(max_turns)
+    _NONINTERACTIVE = True
+    _PLAN_APPROVER = lambda plan: ("no", "")  # never block a headless run on plan approval
+
+    CURRENT_SESSION["id"] = new_session_id()
+    CURRENT_SESSION["created"] = _now()
+    messages = [{"role": "system", "content": system_prompt()},
+                {"role": "user", "content": prompt_text}]
+
+    collected = {"text": [], "final": "", "tools": [], "error": None}
+
+    def sink(obj):
+        t = obj.get("type")
+        if output_format == "stream-json":
+            _default_emit(obj)
+        if t == "token":
+            collected["text"].append(obj.get("delta", ""))
+        elif t == "turn_end":
+            collected["final"] = obj.get("content", "") or "".join(collected["text"])
+        elif t == "tool_start":
+            collected["tools"].append(obj.get("name"))
+        elif t == "error":
+            collected["error"] = obj.get("message")
+
+    _EMIT_SINK = sink
+    try:
+        _serve_run(messages)
+    except Exception as exc:  # noqa: BLE001
+        collected["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        _EMIT_SINK = _default_emit
+        save_session(messages)
+        close_extensions()
+
+    result = collected["final"] or "".join(collected["text"])
+    if output_format == "json":
+        _default_emit({
+            "type": "result",
+            "subtype": "error" if collected["error"] else "success",
+            "result": result,
+            "is_error": bool(collected["error"]),
+            "error": collected["error"],
+            "session_id": CURRENT_SESSION["id"],
+            "num_turns": SESSION.get("requests", 0),
+            "tools_used": collected["tools"],
+            "usage": dict(SESSION),
+            "cost": _session_cost(),
+        })
+    elif output_format == "stream-json":
+        _default_emit({"type": "result", "result": result,
+                       "is_error": bool(collected["error"]),
+                       "session_id": CURRENT_SESSION["id"]})
+    else:  # text
+        if collected["error"]:
+            print(f"[error] {collected['error']}", file=sys.stderr)
+        print(result)
+    return 1 if collected["error"] else 0
 
 
 def serve_main():
@@ -5263,7 +5757,8 @@ def main():
     ap = argparse.ArgumentParser(prog="hera", add_help=True,
                                  description="Hera — agentic coding CLI")
     ap.add_argument("command", nargs="?", default=None,
-                    help="doctor (update + health check) · logout (switch user) · whoami")
+                    help="doctor · logout · whoami · mcp-login <server>")
+    ap.add_argument("extra", nargs="?", default=None, help="argument for `command` (e.g. server name)")
     ap.add_argument("--resume", "-r", nargs="?", const="__latest__", default=None,
                     metavar="ID", help="resume a saved session (latest if no ID)")
     ap.add_argument("--continue", "-c", dest="cont", action="store_true",
@@ -5272,10 +5767,32 @@ def main():
                     help="list saved sessions and exit")
     ap.add_argument("--serve", action="store_true",
                     help="headless JSON mode over stdin/stdout (used by the VS Code extension)")
+    ap.add_argument("--print", "-p", dest="print_prompt", nargs="?", const="", default=None,
+                    metavar="PROMPT",
+                    help="headless one-shot: run PROMPT (or stdin) and print the result, then exit")
+    ap.add_argument("--output-format", dest="output_format", default="text",
+                    choices=["text", "json", "stream-json"],
+                    help="with -p: output as text (default), json, or stream-json")
+    ap.add_argument("--max-turns", dest="max_turns", type=int, default=None,
+                    help="with -p: cap the number of agentic tool round-trips")
+    ap.add_argument("--yolo", action="store_true",
+                    help="auto-approve every tool call (also via HERA_YOLO=1)")
+    ap.add_argument("--add-dir", dest="add_dir", action="append", default=[], metavar="DIR",
+                    help="grant access to an extra directory beyond cwd (repeatable)")
     ap.add_argument("--force", action="store_true",
                     help="with `doctor`: re-download even if already up to date")
     ap.add_argument("--version", "-V", action="version", version=f"{NAME} {VERSION}")
     args = ap.parse_args()
+
+    if args.yolo:
+        globals()["YOLO"] = True
+    for d in args.add_dir:
+        add_extra_dir(d)
+
+    # Headless one-shot print mode (Claude-Code `-p`). Honors stdin when given
+    # with no value: `echo "fix the bug" | hera -p`.
+    if args.print_prompt is not None:
+        sys.exit(print_main(args.print_prompt, args.output_format, args.max_turns))
 
     if args.command == "doctor":
         doctor()
@@ -5289,9 +5806,13 @@ def main():
         resolve_identity()
         print(whoami_label())
         return
+    if args.command == "mcp-login":
+        print(mcp_oauth_login(args.extra))
+        return
     if args.command:
         print(f"{RED}[error] unknown command {args.command!r}. "
-              f"Try: hera doctor · hera logout · hera whoami{R}", file=sys.stderr)
+              f"Try: hera doctor · hera logout · hera whoami · hera mcp-login <server>{R}",
+              file=sys.stderr)
         return
 
     if args.serve:
@@ -5346,6 +5867,7 @@ def main():
     if _HOOK_CONTEXT and messages:
         messages[0]["content"] += f"\n\n<session-start-context>\n{_HOOK_CONTEXT}\n</session-start-context>"
     _emit_telemetry("session_start")
+    _emit_metric("hera.sessions", 1)
 
     try:
         _repl(messages, spinner)
@@ -5450,6 +5972,22 @@ def _repl(messages, spinner):
         if cmd == "/memory":
             memory_report()
             continue
+        if cmd == "/export" or cmd.startswith("/export "):
+            print(f"\n{DIM}{export_conversation(messages, user_input[7:].strip() or None)}{R}\n")
+            continue
+        if cmd == "/init":
+            mark_turn(messages, "/init")
+            messages.append({"role": "user", "content": _init_prompt()})
+            try:
+                ok = run_agent(messages, spinner)
+            except KeyboardInterrupt:
+                spinner.stop(); print(f"\n{DIM}(interrupted){R}\n"); ok = True
+            if not ok:
+                del messages[len(messages) - 1:]
+                if TURN_MARKS:
+                    TURN_MARKS.pop()
+            save_session(messages)
+            continue
         if cmd == "/plugins" or cmd.startswith("/plugins "):
             arg = user_input[8:].strip()
             if arg.startswith("install "):
@@ -5541,6 +6079,59 @@ def _repl(messages, spinner):
         if cmd == "/cwd":
             print(f"\n{DIM}cwd: {os.getcwd()}{R}\n")
             continue
+        if cmd == "/agents":
+            if CUSTOM_AGENTS:
+                print(f"\n{BOLD}Named sub-agents{R} {DIM}(call via the task tool's agent field){R}")
+                for name, body in CUSTOM_AGENTS.items():
+                    meta, _ = _parse_frontmatter(body)
+                    tools = meta.get("tools", "all tools")
+                    print(f"  {CYAN}{name}{R} {DIM}— {tools}{R}")
+                print()
+            else:
+                print(f"\n{DIM}no named agents. Add markdown files in {AGENTS_DIR}/<name>.md "
+                      f"(optional 'tools:' frontmatter).{R}\n")
+            continue
+        if cmd == "/mcp" or cmd.startswith("/mcp "):
+            arg = user_input[4:].strip()
+            if arg.startswith("login"):
+                print(f"\n{DIM}{mcp_oauth_login(arg[5:].strip())}{R}\n")
+            elif _mcp_clients:
+                print(f"\n{BOLD}MCP servers{R}")
+                for c in _mcp_clients:
+                    print(f"  {CYAN}{c.name}{R} {DIM}— {len(c.tools)} tool(s){R}")
+                print(f"{DIM}  authenticate: {R}{CYAN}/mcp login <server>{R}\n")
+            else:
+                print(f"\n{DIM}no MCP servers connected. Configure them in {MCP_CONFIG} "
+                      f"(or bundle mcp.json in a plugin). OAuth: {R}{CYAN}/mcp login <server>{R}\n")
+            continue
+        if cmd == "/permissions" or cmd.startswith("/permissions "):
+            parts = user_input.split(None, 2)
+            if len(parts) >= 3:
+                print(f"\n{DIM}{add_permission(parts[1].lower(), parts[2])}{R}\n")
+            else:
+                print(f"\n{BOLD}Permissions{R} {DIM}(managed rules win; then these){R}")
+                for label, perms in (("managed", _MANAGED_PERMS), ("user", _PERMS)):
+                    for bucket in ("deny", "ask", "allow"):
+                        for rule in (perms.get(bucket) or []):
+                            print(f"  {DIM}{label:8}{R}{CYAN}{bucket:5}{R} {rule}")
+                print(f"{DIM}  add: {R}{CYAN}/permissions deny run_bash(rm *){R}{DIM} · "
+                      f"allow · ask{R}\n")
+            continue
+        if cmd == "/config":
+            print(f"\n{BOLD}Config{R}")
+            for k, v in _config_summary().items():
+                print(f"  {DIM}{k:13}{R}{v}")
+            print()
+            continue
+        if cmd == "/add-dir" or cmd.startswith("/add-dir "):
+            arg = user_input[8:].strip()
+            if arg:
+                print(f"\n{DIM}{add_extra_dir(arg)}{R}\n")
+            elif EXTRA_DIRS:
+                print(f"\n{DIM}trusted dirs (beyond cwd):\n  " + "\n  ".join(EXTRA_DIRS) + f"{R}\n")
+            else:
+                print(f"\n{DIM}no extra dirs. Add one with {R}{CYAN}/add-dir <path>{R}{DIM}.{R}\n")
+            continue
         if cmd == "/reasoning":
             HIDE_REASONING = not HIDE_REASONING
             state = "hidden" if HIDE_REASONING else "visible"
@@ -5548,16 +6139,18 @@ def _repl(messages, spinner):
             continue
         if cmd == "/think" or cmd.startswith("/think "):
             arg = user_input[6:].strip().lower()
-            if arg in ("off", "normal", "hard"):
+            if arg in ("off", "normal", "hard", "max"):
                 globals()["THINK_LEVEL"] = arg
                 save_config({"think": arg})
                 blurb = {"off": "no model thinking (fastest)",
                          "normal": "default thinking",
-                         "hard": "deeper thinking enabled"}[arg]
+                         "hard": "deeper thinking enabled",
+                         "max": "deepest thinking enabled"}[arg]
                 print(f"\n{DIM}thinking → {BOLD}{arg}{R}{DIM} ({blurb}).{R}\n")
             else:
                 print(f"\n{DIM}thinking is {BOLD}{THINK_LEVEL}{R}{DIM}. "
-                      f"Use {R}{CYAN}/think off|normal|hard{R}{DIM}.{R}\n")
+                      f"Use {R}{CYAN}/think off|normal|hard|max{R}{DIM} "
+                      f"(or say 'ultrathink' in a prompt).{R}\n")
             continue
         if cmd == "/output-style" or cmd.startswith("/output-style "):
             arg = user_input[14:].strip()

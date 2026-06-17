@@ -44,7 +44,7 @@ automatically, or you can force one explicitly with `@skill:<id>` or `/skill <id
    ```
    (Or set `hera.command` in the extension settings to an absolute path — e.g.
    `~/.local/bin/hera`, or on Windows the full path to your `hera.py` launcher.) Confirm it's
-   found: `hera --version` should print `Hera 0.8.9`.
+   found: `hera --version` should print `Hera 0.8.33`.
 3. **Credentials.** Easiest: **run `hera` once in a terminal and paste your key** (see
    [`ACCESS_CLI.md`](ACCESS_CLI.md)). That saves `~/.config/hera/config.json` (endpoint + key +
    your resolved account email), and `hera --serve` — what the extension drives — reads that file
@@ -68,10 +68,10 @@ distributed as source (no Marketplace listing), so you load it locally:
 ```bash
 cd ide/vscode-hera
 npm install -g @vscode/vsce        # one-time: the VS Code packaging tool
-vsce package                       # produces hera-cli-0.2.0.vsix
+vsce package                       # produces hera-cli-0.3.4.vsix
 ```
 Then in VS Code: **Extensions → ⋯ (top-right) → Install from VSIX…** and pick the file. In Cursor
-the menu is the same. (You can also install from the CLI: `code --install-extension hera-cli-0.2.0.vsix`.)
+the menu is the same. (You can also install from the CLI: `code --install-extension hera-cli-0.3.4.vsix`.)
 
 ---
 

@@ -297,14 +297,14 @@ the live catalog the proxy is serving.
 | `HERA_MODEL` | `qwen3.6-35b-a3b` | Model name sent to the API |
 | `HERA_NAME` | `Hera` | Assistant display name |
 | `HERA_YOLO` | `0` | `1` = auto-approve every tool call (sandbox only) |
-| `HERA_MAX_STEPS` | `25` | Max tool round-trips per message |
+| `HERA_MAX_STEPS` | `0` | Max tool round-trips per message (`0` = unlimited; set a number to cap) |
 | `HERA_HIDE_REASONING` | `0` | `1` = don't stream the model's thinking |
 | `HERA_PLAN` | `0` | `1` = start in plan mode (propose before editing) |
 | `HERA_NO_VERIFY` | `0` | `1` = don't auto-run/verify code after edits |
 | `HERA_AUTO_MODE` | `read` | Auto-approve level: `read` / `edit` / `all` (per-project; `/auto` overrides & persists) |
 | `HERA_NO_SUGGESTIONS` | `0` | `1` = don't print "Next steps" tips after a task |
 | `HERA_PRICE_IN` / `HERA_PRICE_OUT` | `0` | USD per 1M input/output tokens → show `$` cost |
-| `HERA_CONTEXT_TOKENS` / `HERA_AUTO_COMPACT_AT` | `32000` / `0.8` | Auto-compact history near the context window |
+| `HERA_CONTEXT_TOKENS` / `HERA_AUTO_COMPACT_AT` | `131072` / `0.8` | Auto-compact history near the context window (131072 matches the model's actual context window) |
 | `HERA_VISION_URL` | _(empty)_ | Vision endpoint for attached images. Unset → images attached but not interpreted (text-only model) |
 | `HERA_VISION_MODEL` | = `HERA_MODEL` | Model name at `HERA_VISION_URL` |
 | `HERA_NO_COLOR` | `0` | `1` = disable colour/styling (also honours `NO_COLOR`) |
@@ -327,11 +327,11 @@ the live catalog the proxy is serving.
 
 ## Updating
 
-Current release: **0.8.9**. On launch Hera checks the published version (at most once a day,
+Current release: **0.8.33**. On launch Hera checks the published version (at most once a day,
 fail-silent) and prints a one-line notice when a newer one is out:
 
 ```
-↑ update available: Hera 0.8.9 (you have 0.6.1)
+↑ update available: Hera 0.8.33 (you have 0.8.9)
   re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
 ```
 

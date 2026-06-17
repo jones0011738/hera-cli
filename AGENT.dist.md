@@ -14,7 +14,21 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.28`.
+- **Version:** `0.8.33`.
+- **All limits removed** — no artificial execution or performance caps unless the user explicitly sets them:
+  - `HERA_MAX_STEPS` default `0` (unlimited; was `25`). All three agentic loops (`run_turn`, `_serve_run`, `run_subagent`) use `while True` with `if MAX_STEPS and step >= MAX_STEPS: break`; the old `[stopped] hit MAX_STEPS=25` message only fires when the user sets a positive cap.
+  - `HERA_MAX_TOOL_OUTPUT` default `0` (unlimited). Truncation only when set to a positive number.
+  - `tool_run_bash` default `timeout=3600` (was 30 s).
+  - `HERA_WEB_TIMEOUT` default `60` (was 20 s).
+  - `HERA_CONTEXT_TOKENS` default `131072` (matches the actual model context window; was `32000` which matched per-slot size).
+- **Auto `replace_all`** — `tool_edit_file` (and `tool_multi_edit`) silently promote to `replace_all=True` when `old_string` appears more than once, instead of surfacing `old_string is not unique` to the user.
+- **Clean TypeError messages** — `_exec_call` and `_serve_exec` strip the `tool_` prefix from Python function names in TypeError output, so users see `edit_file() missing arguments` not `tool_edit_file() missing arguments`.
+- **`whoami` always live** — `resolve_identity(force=False)` gains a `force` parameter; `hera whoami` calls `resolve_identity(force=True)` to bypass the config cache and always hit the `/whoami` API.
+- **Previous v0.8.28 changes below.**
+- **Live MCP-OAuth test** — `test_mcp_oauth_live` stands up a throwaway local token server and
+  drives `mcp_oauth_login` through the real callback + PKCE token exchange (success and a
+  PKCE-mismatch rejection), faking only the browser consent. Resolves the earlier "untested live
+  flow" caveat.
 - **Live MCP-OAuth test** — `test_mcp_oauth_live` stands up a throwaway local token server and
   drives `mcp_oauth_login` through the real callback + PKCE token exchange (success and a
   PKCE-mismatch rejection), faking only the browser consent. Resolves the earlier "untested live

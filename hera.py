@@ -14,7 +14,7 @@ Required:       HERA_API_URL  (the endpoint, e.g. http://<host>:8080/v1 — no h
 Optional:       HERA_MODEL          (default qwen3.6-35b-a3b)
                 HERA_NAME           (assistant display name; default Hera)
                 HERA_YOLO=1         auto-approve every tool call (no prompts)
-                HERA_MAX_STEPS      max tool round-trips per message (default 25)
+                HERA_MAX_STEPS      max tool round-trips per message (default: unlimited)
                 HERA_HIDE_REASONING=1   don't stream the model's thinking
                 HERA_NO_SUGGESTIONS=1   don't print "Next steps" tips after a task
                 HERA_NO_VERIFY=1    don't auto-run/verify code after editing it
@@ -153,7 +153,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.31"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.32"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -5724,7 +5724,8 @@ def _serve_exec(c):
     try:
         out = TOOLS[name](**args)
     except TypeError as exc:
-        out = f"[error] bad arguments: {exc}"
+        msg = str(exc).replace(f"tool_{name}()", f"{name}()")
+        out = f"[error] bad arguments: {msg}"
     except Exception as exc:  # noqa: BLE001
         out = f"[error] {type(exc).__name__}: {exc}"
     is_err = str(out).startswith("[error]")
@@ -5759,7 +5760,13 @@ def _serve_run(messages):
     change_requested = _wants_code_change(last_user)
     globals()["_TURN_THINK"] = _keyword_think_level(last_user)
     _maybe_auto_compact(messages, emit=_emit)
-    for _ in range(MAX_STEPS):
+    serve_step = 0
+    while True:
+        if MAX_STEPS and serve_step >= MAX_STEPS:
+            _emit({"type": "turn_end", "content": f"[stopped: hit MAX_STEPS={MAX_STEPS}]",
+                   "turn_tokens": turn, "session_tokens": dict(SESSION)})
+            return
+        serve_step += 1
         res = _serve_stream(messages)
         if res is None:
             return
@@ -5825,8 +5832,6 @@ def _serve_run(messages):
                 if _is_code_file(cargs.get("path", "")):
                     edited_code = True
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": out})
-    _emit({"type": "turn_end", "content": "[stopped: hit MAX_STEPS]",
-           "turn_tokens": turn, "session_tokens": dict(SESSION)})
 
 
 def print_main(prompt_text, output_format="text", max_turns=None):

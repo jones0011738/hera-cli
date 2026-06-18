@@ -153,7 +153,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.38"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.39"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -696,11 +696,27 @@ def _select_endpoint(messages):
 
 
 # ── Sandbox detection ─────────────────────────────────────────────────────────
+def _probe_bwrap():
+    """Return True only if bwrap is installed AND user namespaces are enabled.
+    Some kernels/VMs disable unprivileged user namespaces (kernel.unprivileged_
+    userns_clone=0), which makes bwrap fail at runtime even when the binary exists."""
+    if not shutil.which("bwrap"):
+        return False
+    try:
+        r = subprocess.run(
+            ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--", "true"],
+            timeout=5, capture_output=True,
+        )
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _detect_sandbox():
     """Pick the best available run_bash sandbox: bwrap > unshare > none."""
     if SANDBOX_MODE == "none":
         return "none"
-    have_bwrap = bool(shutil.which("bwrap"))
+    have_bwrap = _probe_bwrap()
     have_unshare = sys.platform.startswith("linux") and bool(shutil.which("unshare"))
     if SANDBOX_MODE == "bwrap":
         return "bwrap" if have_bwrap else "none"

@@ -243,7 +243,7 @@ PRICE_OUT = float(_cfg("HERA_PRICE_OUT", key="price_out", default="0") or 0)
 
 # Auto-compaction: when the estimated prompt size crosses AUTO_COMPACT_AT * the
 # context window, the history is summarized before the next turn. 0 disables.
-CONTEXT_TOKENS  = int(_cfg("HERA_CONTEXT_TOKENS", key="context_tokens", default="131072") or 0)
+CONTEXT_TOKENS  = int(_cfg("HERA_CONTEXT_TOKENS", key="context_tokens", default="65536") or 0)
 AUTO_COMPACT_AT = float(_cfg("HERA_AUTO_COMPACT_AT", key="auto_compact_at", default="0.8") or 0)
 
 # User hooks: config["hooks"] = {"PreToolUse":[{"matcher":"run_bash","command":"..."}], …}.

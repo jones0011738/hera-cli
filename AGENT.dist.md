@@ -20,7 +20,7 @@ aiming for Claude-Code-class behavior.
   - `HERA_MAX_TOOL_OUTPUT` default `0` (unlimited). Truncation only when set to a positive number.
   - `tool_run_bash` default `timeout=3600` (was 30 s).
   - `HERA_WEB_TIMEOUT` default `60` (was 20 s).
-  - `HERA_CONTEXT_TOKENS` default `131072` (matches the actual model context window; was `32000` which matched per-slot size).
+  - `HERA_CONTEXT_TOKENS` default `131072` (was `32000`). Server is now `--ctx-size 262144 --parallel 4` = **65536 tokens per slot**; set `HERA_CONTEXT_TOKENS=65536` so auto-compaction fires before the slot fills.
 - **Auto `replace_all`** — `tool_edit_file` (and `tool_multi_edit`) silently promote to `replace_all=True` when `old_string` appears more than once, instead of surfacing `old_string is not unique` to the user.
 - **Clean TypeError messages** — `_exec_call` and `_serve_exec` strip the `tool_` prefix from Python function names in TypeError output, so users see `edit_file() missing arguments` not `tool_edit_file() missing arguments`.
 - **`whoami` always live** — `resolve_identity(force=False)` gains a `force` parameter; `hera whoami` calls `resolve_identity(force=True)` to bypass the config cache and always hit the `/whoami` API.

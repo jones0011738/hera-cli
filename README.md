@@ -304,7 +304,7 @@ the live catalog the proxy is serving.
 | `HERA_AUTO_MODE` | `read` | Auto-approve level: `read` / `edit` / `all` (per-project; `/auto` overrides & persists) |
 | `HERA_NO_SUGGESTIONS` | `0` | `1` = don't print "Next steps" tips after a task |
 | `HERA_PRICE_IN` / `HERA_PRICE_OUT` | `0` | USD per 1M input/output tokens → show `$` cost |
-| `HERA_CONTEXT_TOKENS` / `HERA_AUTO_COMPACT_AT` | `65536` / `0.8` | Auto-compact history near the context window. Server runs `--ctx-size 262144 --parallel 4` = 65536 tokens per slot; set this to match |
+| `HERA_CONTEXT_TOKENS` / `HERA_AUTO_COMPACT_AT` | `131072` / `0.8` | Auto-compact history near the context window. Server runs `--ctx-size 262144 --parallel 2` = 131072 tokens per slot; default matches exactly |
 | `HERA_VISION_URL` | _(empty)_ | Vision endpoint for attached images. Unset → images attached but not interpreted (text-only model) |
 | `HERA_VISION_MODEL` | = `HERA_MODEL` | Model name at `HERA_VISION_URL` |
 | `HERA_NO_COLOR` | `0` | `1` = disable colour/styling (also honours `NO_COLOR`) |

@@ -44,10 +44,6 @@ aiming for Claude-Code-class behavior.
   drives `mcp_oauth_login` through the real callback + PKCE token exchange (success and a
   PKCE-mismatch rejection), faking only the browser consent. Resolves the earlier "untested live
   flow" caveat.
-- **Live MCP-OAuth test** — `test_mcp_oauth_live` stands up a throwaway local token server and
-  drives `mcp_oauth_login` through the real callback + PKCE token exchange (success and a
-  PKCE-mismatch rejection), faking only the browser consent. Resolves the earlier "untested live
-  flow" caveat.
 - **Vim keybindings** (was deferred) — `/vim` or `HERA_VIM=1`. Each prompt starts in INSERT;
   Esc → NORMAL. `vim_normal_key` is a pure, tested state machine: motions `h l 0 $ w b e`,
   mode switches `i a I A`, edits `x D C`, operators `dd dw d$ cw cc` (`d`/`c` + motion). Wired

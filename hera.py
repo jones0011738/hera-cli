@@ -23,10 +23,11 @@ Optional:       HERA_MODEL          (default qwen3.6-35b-a3b)
                 HERA_PRICE_IN / HERA_PRICE_OUT   USD per 1M tokens SYM_ARROW_R show $ cost
                 HERA_CONTEXT_TOKENS / HERA_AUTO_COMPACT_AT   auto-compact history
                                     when it nears the context window (default 32000, 0.8)
-                HERA_VISION_URL     vision endpoint for image attachments (the
-                                    main model is text-only; without this, images
-                                    are attached but not interpreted)
-                HERA_VISION_MODEL   model name at HERA_VISION_URL
+                HERA_VISION_URL     optional override for image attachments.
+                                    By default Hera sends image turns to the
+                                    main API URL; if that endpoint can't handle
+                                    them it falls back to built-in OCR/metadata.
+                HERA_VISION_MODEL   optional model name at HERA_VISION_URL
 
 Config file (~/.config/hera/config.json) also supports:
     "hooks":       {"PreToolUse":[{"matcher":"run_bash","command":"SYM_ELLIPSIS"}], "PostToolUse":[SYM_ELLIPSIS], "Stop":[SYM_ELLIPSIS]}
@@ -40,6 +41,7 @@ Legacy QWEN_* variables (and LLAMA_API_KEY) are still honoured as fallbacks.
 import argparse
 import ast
 import base64
+import binascii
 import contextlib
 import difflib
 import fnmatch
@@ -56,6 +58,7 @@ import random
 import re
 import select
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -153,7 +156,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.44"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.45"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -172,11 +175,15 @@ ANTHROPIC_VERSION = _env("HERA_ANTHROPIC_VERSION", default="2023-06-01")
 MAX_OUTPUT_TOKENS = int(_env("HERA_MAX_OUTPUT_TOKENS", default="32768") or 32768)
 # Vim keybindings in the prompt editor (toggle with /vim or HERA_VIM=1).
 VIM_MODE = _truthy(_env("HERA_VIM"))
-# Vision: the main model is text-only. If a vision-capable OpenAI-compatible
-# endpoint is configured, turns that carry an attached image are routed to it;
-# otherwise images are attached but flagged as not-interpreted (see stream_turn).
-VISION_URL   = _cfg("HERA_VISION_URL", key="vision_url", default="").rstrip("/")
-VISION_MODEL = _env("HERA_VISION_MODEL", default="")
+# Vision: by default image turns go to the same OpenAI-compatible API URL as
+# normal chat, which lets a proxy route them to a dedicated vision backend. If
+# that request path fails, Hera falls back to a built-in local image inspector
+# (metadata + OCR when available), so image attachments still become usable
+# context by default.
+_EXPLICIT_VISION_URL = _cfg("HERA_VISION_URL", key="vision_url", default="").rstrip("/")
+VISION_URL   = (_EXPLICIT_VISION_URL or API_URL).rstrip("/")
+VISION_MODEL = _cfg("HERA_VISION_MODEL", key="vision_model", default="").strip()
+VISION_AUTO  = not bool(_EXPLICIT_VISION_URL) and bool(VISION_URL)
 IMAGE_EXTS   = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 YOLO    = _truthy(_env("HERA_YOLO", "QWEN_YOLO"))
 MAX_STEPS      = int(_env("HERA_MAX_STEPS", "QWEN_MAX_STEPS", default="0"))  # 0 = unlimited
@@ -458,6 +465,17 @@ def _is_code_file(path):
     return str(path or "").lower().endswith(_CODE_EXTS)
 
 
+def _tool_touches_code(name, args):
+    if name in ("write_file", "edit_file", "multi_edit", "notebook_edit", "delete_path"):
+        return _is_code_file(args.get("path"))
+    if name == "move_path":
+        return _is_code_file(args.get("source")) or _is_code_file(args.get("destination"))
+    if name == "apply_patch":
+        changes = _proposed_changes_for_tool(name, args)
+        return any(_is_code_file(ch.get("path")) or _is_code_file(ch.get("src")) for ch in changes)
+    return False
+
+
 def _detect_project_commands(cwd=None):
     """Inspect the working dir for build/test markers and return the preferred
     verification commands (pytest / package.json scripts / Makefile target /
@@ -619,7 +637,7 @@ AGENTS_DIR   = os.path.join(CONFIG_DIR, "agents")
 # --serve mode) to ask the current model turn to stop mid-stream. Cleared at the
 # start of every turn. See interruptible() and stream_turn().
 _INTERRUPT = threading.Event()
-_VISION_WARNED = False  # warn once per process when an image can't be interpreted
+_VISION_WARNED = False  # warn once per process when image analysis falls back
 
 # Thread-local "quiet" flag: parallel sub-agents run on worker threads and must
 # not interleave their live streaming on the shared stdout. When set, stream_turn
@@ -659,9 +677,118 @@ def _msg_has_image(m):
         isinstance(p, dict) and p.get("type") == "image_url" for p in c)
 
 
+def _data_url_bytes(url):
+    if not (isinstance(url, str) and url.startswith("data:") and "," in url):
+        return None, None
+    meta, b64 = url.split(",", 1)
+    mime = meta[5:].split(";")[0] or "application/octet-stream"
+    try:
+        return mime, base64.b64decode(b64)
+    except (ValueError, binascii.Error):
+        return mime, None
+
+
+def _image_dimensions(raw, mime):
+    try:
+        if mime == "image/png" and raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) >= 24:
+            return struct.unpack(">II", raw[16:24])
+        if mime == "image/gif" and raw[:6] in (b"GIF87a", b"GIF89a") and len(raw) >= 10:
+            return struct.unpack("<HH", raw[6:10])
+        if mime in ("image/jpeg", "image/jpg"):
+            i = 2
+            while i + 9 < len(raw):
+                if raw[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = raw[i + 1]
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                              0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    h, w = struct.unpack(">HH", raw[i + 5:i + 9])
+                    return w, h
+                seglen = struct.unpack(">H", raw[i + 2:i + 4])[0]
+                if seglen < 2:
+                    break
+                i += 2 + seglen
+        if mime == "image/bmp" and len(raw) >= 26 and raw[:2] == b"BM":
+            return struct.unpack("<II", raw[18:26])
+        if mime == "image/webp" and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            if raw[12:16] == b"VP8X" and len(raw) >= 30:
+                w = 1 + int.from_bytes(raw[24:27], "little")
+                h = 1 + int.from_bytes(raw[27:30], "little")
+                return w, h
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _ocr_image(raw, suffix):
+    if not shutil.which("tesseract"):
+        return ""
+    tmp = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(prefix="hera-img-", suffix=suffix, delete=False)
+        tmp.write(raw)
+        tmp.close()
+        proc = subprocess.run(
+            ["tesseract", tmp.name, "stdout", "--psm", "6"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode == 0:
+            return (proc.stdout or "").strip()[:4000]
+    except Exception:  # noqa: BLE001
+        return ""
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+    return ""
+
+
+def _analyze_image_data_url(url):
+    mime, raw = _data_url_bytes(url)
+    if not raw:
+        return "- Image attached but it could not be decoded."
+    dims = _image_dimensions(raw, mime)
+    suffix = mimetypes.guess_extension(mime or "") or ".img"
+    ocr = _ocr_image(raw, suffix)
+    lines = [
+        "- Image attached",
+        f"- MIME type: {mime or 'unknown'}",
+        f"- Size: {len(raw):,} bytes",
+    ]
+    if dims:
+        lines.append(f"- Dimensions: {dims[0]}x{dims[1]} px")
+    if ocr:
+        lines.append("- OCR text:")
+        lines.append(ocr)
+    else:
+        lines.append("- OCR text: unavailable or no readable text detected")
+    return "\n".join(lines)
+
+
+def _vision_fallback_notice():
+    if VISION_AUTO:
+        return "image attached — vision route unavailable, falling back to built-in local image analysis"
+    if VISION_URL:
+        return "image attached — configured vision endpoint unavailable, falling back to built-in local image analysis"
+    return "image attached — using built-in local image analysis"
+
+
+def tool_view_image(path):
+    """Inspect a local image file using built-in metadata parsing + OCR."""
+    p = _resolve(path)
+    if not os.path.isfile(p):
+        return f"[error] no such file: {p}"
+    du = _image_data_url(p)
+    if not du:
+        return f"[error] could not read image: {p}"
+    return f"{p}\n\n{_analyze_image_data_url(du)}"
+
+
 def _downconvert_images(messages):
-    """Replace image parts with a text placeholder so a text-only model can
-    still answer the turn (it just can't see the picture)."""
+    """Replace image parts with built-in image analysis for fallback text turns."""
     out = []
     for m in messages:
         if not _msg_has_image(m):
@@ -672,27 +799,22 @@ def _downconvert_images(messages):
             if p.get("type") == "text":
                 texts.append(p.get("text", ""))
             elif p.get("type") == "image_url":
-                texts.append("[image attached SYM_EMDASH not interpreted by this text-only model]")
+                url = (p.get("image_url") or {}).get("url", "")
+                texts.append(_analyze_image_data_url(url))
         nm = dict(m)
         nm["content"] = "\n".join(t for t in texts if t).strip() or "[image attached]"
         out.append(nm)
     return out
 
 
-def _select_endpoint(messages):
-    """Pick (url, model, messages, downgraded) for a turn.
-
-    If any message carries an image and HERA_VISION_URL is set, route to that
-    vision endpoint/model. If an image is present but no vision endpoint is
-    configured, down-convert the images to text and flag `downgraded` so the
-    caller can warn that the current model can't see them.
-    """
+def _select_endpoint(messages, force_builtin=False):
+    """Pick (url, model, messages, downgraded, vision_mode) for a turn."""
     has_image = any(_msg_has_image(m) for m in messages)
-    if has_image and VISION_URL:
-        return VISION_URL, (VISION_MODEL or MODEL), messages, False
+    if has_image and not force_builtin and VISION_URL:
+        return VISION_URL, (VISION_MODEL or MODEL), messages, False, "endpoint"
     if has_image:
-        return API_URL, MODEL, _downconvert_images(messages), True
-    return API_URL, MODEL, messages, False
+        return API_URL, MODEL, _downconvert_images(messages), True, "builtin"
+    return API_URL, MODEL, messages, False, "text"
 
 
 # ── Sandbox detection ─────────────────────────────────────────────────────────
@@ -976,6 +1098,7 @@ SYM_ARROW_L  = _u("←", "<-")
 SYM_HOOKED   = _u("↳", ">")
 SYM_SUB      = _u("⤷", ">")
 SYM_RECYCLE  = _u("⟳", "~")
+SYM_APPROX   = _u("≈", "~")
 SYM_DIAMOND  = _u("◆", "+")
 SYM_SUBARROW = _u("›", ">")
 # Status marks
@@ -1065,6 +1188,8 @@ class Spinner:
         last_rot = time.time()
         i = 0
         while not self._stop.is_set():
+            if getattr(sys, "is_finalizing", lambda: False)():
+                return
             now = time.time()
             secs = now - self._t0
             if whimsy and now - last_rot >= self._ROTATE_EVERY:
@@ -1072,7 +1197,11 @@ class Spinner:
                 last_rot = now
             f = self._FRAMES[i % len(self._FRAMES)]
             tail = "SYM_ELLIPSIS" if whimsy else ""
-            print(f"\r  {CYAN}{f}{R}  {DIM}{word}{tail} {secs:.1f}s{R}   ", end="", flush=True)
+            try:
+                print(f"\r  {CYAN}{f}{R}  {DIM}{word}{tail} {secs:.1f}s{R}   ",
+                      end="", flush=True)
+            except Exception:  # noqa: BLE001
+                return
             i += 1
             time.sleep(0.1)
 
@@ -1087,7 +1216,11 @@ class Spinner:
         self._stop.set()
         if self._t and self._t.is_alive():
             self._t.join()
-        print(f"\r{' ' * 48}\r", end="", flush=True)
+        if not getattr(sys, "is_finalizing", lambda: False)():
+            try:
+                print(f"\r{' ' * 48}\r", end="", flush=True)
+            except Exception:  # noqa: BLE001
+                pass
         return elapsed
 
 
@@ -1478,6 +1611,289 @@ def tool_notebook_edit(path, cell_index=None, new_source="", cell_type=None,
     return f"Edited {p} ({msg})"
 
 
+def _ensure_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+
+
+def tool_move_path(source, destination, overwrite=False):
+    src = _resolve(source)
+    dst = _resolve(destination)
+    if not os.path.exists(src):
+        return f"[error] no such path: {src}"
+    if src == dst:
+        return "[error] source and destination are the same path"
+    if os.path.exists(dst) and not overwrite:
+        return f"[error] destination already exists: {dst}"
+    src_backup = _backup_path(src)
+    dst_existed = os.path.exists(dst)
+    dst_backup = _backup_path(dst) if dst_existed else None
+    try:
+        if dst_existed:
+            _rm_path(dst)
+        _ensure_parent_dir(dst)
+        shutil.move(src, dst)
+    except Exception as exc:  # noqa: BLE001
+        _cleanup_backup(src_backup)
+        _cleanup_backup(dst_backup)
+        return f"[error] move failed: {exc}"
+    push_transaction([
+        {"kind": "backup_restore", "path": src, "backup": src_backup, "existed": True,
+         "label": "move_path"},
+        {"kind": "backup_restore", "path": dst, "backup": dst_backup, "existed": dst_existed,
+         "label": "move_path"},
+    ], "move_path")
+    return f"Moved {src} {SYM_ARROW_R} {dst}"
+
+
+def tool_delete_path(path, recursive=False):
+    p = _resolve(path)
+    if not os.path.exists(p):
+        return f"[error] no such path: {p}"
+    if os.path.isdir(p) and not os.path.islink(p):
+        try:
+            entries = os.listdir(p)
+        except OSError as exc:
+            return f"[error] cannot inspect directory: {exc}"
+        if entries and not recursive:
+            return f"[error] directory not empty: {p} (set recursive=true to delete it)"
+    backup = _backup_path(p)
+    try:
+        _rm_path(p)
+    except Exception as exc:  # noqa: BLE001
+        _cleanup_backup(backup)
+        return f"[error] delete failed: {exc}"
+    CHECKPOINTS.append({
+        "kind": "backup_restore",
+        "path": p,
+        "backup": backup,
+        "existed": True,
+        "label": "delete_path",
+    })
+    return f"Deleted {p}"
+
+
+def _find_subsequence(haystack, needle, start=0):
+    if not needle:
+        return start
+    limit = len(haystack) - len(needle) + 1
+    for i in range(max(0, start), max(0, limit)):
+        if haystack[i:i + len(needle)] == needle:
+            return i
+    return None
+
+
+def _parse_apply_patch(patch):
+    lines = patch.splitlines()
+    if not lines or lines[0] != "*** Begin Patch":
+        return None, "patch must start with '*** Begin Patch'"
+    ops, i = [], 1
+    while i < len(lines):
+        line = lines[i]
+        if line == "*** End Patch":
+            if i != len(lines) - 1:
+                tail = [x for x in lines[i + 1:] if x.strip()]
+                if tail:
+                    return None, "unexpected content after '*** End Patch'"
+            return ops, ""
+        if line.startswith("*** Add File: "):
+            path = line[len("*** Add File: "):].strip()
+            i += 1
+            content = []
+            while i < len(lines) and not lines[i].startswith("*** "):
+                if not lines[i].startswith("+"):
+                    return None, f"add-file body must use '+' lines ({path})"
+                content.append(lines[i][1:])
+                i += 1
+            ops.append({"type": "add", "path": path,
+                        "content": ("\n".join(content) + ("\n" if content else ""))})
+            continue
+        if line.startswith("*** Delete File: "):
+            ops.append({"type": "delete", "path": line[len("*** Delete File: "):].strip()})
+            i += 1
+            continue
+        if line.startswith("*** Update File: "):
+            path = line[len("*** Update File: "):].strip()
+            i += 1
+            move_to = None
+            if i < len(lines) and lines[i].startswith("*** Move to: "):
+                move_to = lines[i][len("*** Move to: "):].strip()
+                i += 1
+            hunks = []
+            while i < len(lines) and not lines[i].startswith("*** "):
+                if not lines[i].startswith("@@"):
+                    return None, f"expected hunk header in update for {path}"
+                header = lines[i]
+                i += 1
+                hunk_lines = []
+                while i < len(lines) and not lines[i].startswith("@@") and not lines[i].startswith("*** "):
+                    if lines[i] == "*** End of File":
+                        i += 1
+                        break
+                    if not lines[i] or lines[i][0] not in (" ", "+", "-"):
+                        return None, f"invalid hunk line in update for {path}: {lines[i]!r}"
+                    hunk_lines.append(lines[i])
+                    i += 1
+                hunks.append({"header": header, "lines": hunk_lines})
+            if not hunks and not move_to:
+                return None, f"update for {path} has no hunks"
+            ops.append({"type": "update", "path": path, "move_to": move_to, "hunks": hunks})
+            continue
+        return None, f"unrecognized patch line: {line!r}"
+    return None, "patch is missing '*** End Patch'"
+
+
+def _apply_hunks_to_text(text, hunks, path):
+    lines = text.splitlines()
+    cursor = 0
+    for hunk in hunks:
+        old_seq, new_seq = [], []
+        for line in hunk["lines"]:
+            if line.startswith(" "):
+                old_seq.append(line[1:])
+                new_seq.append(line[1:])
+            elif line.startswith("-"):
+                old_seq.append(line[1:])
+            elif line.startswith("+"):
+                new_seq.append(line[1:])
+        idx = _find_subsequence(lines, old_seq, cursor)
+        if idx is None:
+            idx = _find_subsequence(lines, old_seq, 0)
+        if idx is None:
+            snippet = " | ".join(old_seq[:3])[:120]
+            return None, f"could not match patch hunk in {path}: {snippet!r}"
+        lines = lines[:idx] + new_seq + lines[idx + len(old_seq):]
+        cursor = idx + len(new_seq)
+    return ("\n".join(lines) + ("\n" if lines else "")), ""
+
+
+def _simulate_apply_patch(patch):
+    ops, err = _parse_apply_patch(patch)
+    if err:
+        return None, err
+    changes = []
+    for op in ops:
+        path = _resolve(op["path"])
+        if op["type"] == "add":
+            if os.path.exists(path):
+                return None, f"add target already exists: {path}"
+            changes.append({"kind": "write", "path": path, "before": "", "after": op["content"],
+                            "existed": False})
+            continue
+        if op["type"] == "delete":
+            if not os.path.isfile(path):
+                return None, f"delete target is not a file: {path}"
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                before = f.read()
+            changes.append({"kind": "delete", "path": path, "before": before, "existed": True})
+            continue
+        if not os.path.isfile(path):
+            return None, f"update target is not a file: {path}"
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            before = f.read()
+        after, err = _apply_hunks_to_text(before, op["hunks"], path)
+        if err:
+            return None, err
+        move_to = _resolve(op["move_to"]) if op.get("move_to") else path
+        dst_existed, dst_before = _snapshot(move_to)
+        if move_to != path and dst_existed:
+            return None, f"move destination already exists: {move_to}"
+        if move_to != path:
+            changes.append({
+                "kind": "move_write",
+                "src": path,
+                "path": move_to,
+                "before": before,
+                "after": after,
+                "dst_before": dst_before or "",
+                "dst_existed": dst_existed,
+            })
+        else:
+            changes.append({"kind": "write", "path": path, "before": before, "after": after,
+                            "existed": True})
+    return changes, ""
+
+
+def _checkpoints_for_changes(changes, label):
+    checkpoints = []
+    for ch in changes:
+        if ch["kind"] == "write":
+            checkpoints.append({
+                "kind": "file_restore",
+                "path": ch["path"],
+                "existed": ch.get("existed", bool(ch["before"])),
+                "content": ch["before"],
+                "label": label,
+            })
+        elif ch["kind"] == "delete":
+            checkpoints.append({
+                "kind": "file_restore",
+                "path": ch["path"],
+                "existed": True,
+                "content": ch["before"],
+                "label": label,
+            })
+        elif ch["kind"] == "move_write":
+            checkpoints.append({
+                "kind": "file_restore",
+                "path": ch["src"],
+                "existed": True,
+                "content": ch["before"],
+                "label": label,
+            })
+            checkpoints.append({
+                "kind": "file_restore",
+                "path": ch["path"],
+                "existed": ch.get("dst_existed", False),
+                "content": ch.get("dst_before", ""),
+                "label": label,
+            })
+    return checkpoints
+
+
+def _apply_changes(changes, label):
+    checkpoints = _checkpoints_for_changes(changes, label)
+    try:
+        for ch in changes:
+            if ch["kind"] == "write":
+                _ensure_parent_dir(ch["path"])
+                with open(ch["path"], "w", encoding="utf-8") as f:
+                    f.write(ch["after"])
+            elif ch["kind"] == "delete":
+                os.remove(ch["path"])
+            elif ch["kind"] == "move_write":
+                _ensure_parent_dir(ch["path"])
+                os.remove(ch["src"])
+                with open(ch["path"], "w", encoding="utf-8") as f:
+                    f.write(ch["after"])
+    except Exception as exc:  # noqa: BLE001
+        for cp in reversed(checkpoints):
+            try:
+                _undo_checkpoint(cp)
+            except Exception:  # noqa: BLE001
+                pass
+        return False, str(exc)
+    push_transaction(checkpoints, label)
+    return True, ""
+
+
+def tool_apply_patch(patch):
+    changes, err = _simulate_apply_patch(patch)
+    if err:
+        return f"[error] {err}"
+    ok, err = _apply_changes(changes, "apply_patch")
+    if not ok:
+        return f"[error] apply_patch failed: {err}"
+    touched = []
+    for ch in changes:
+        if ch["kind"] == "move_write":
+            touched.append(f"{ch['src']} {SYM_ARROW_R} {ch['path']}")
+        else:
+            touched.append(ch["path"])
+    return f"Applied patch ({len(changes)} file change{'s' if len(changes) != 1 else ''})\n" + "\n".join(touched[:20])
+
+
 def _missing_program(command, stderr, returncode):
     """Detect a 'command not found' failure and return the missing binary name."""
     if returncode != 127:
@@ -1725,18 +2141,23 @@ def tool_web_fetch(url, max_chars=9000):
 TOOLS = {
     "list_dir":   tool_list_dir,
     "read_file":  tool_read_file,
+    "view_image": tool_view_image,
     "glob":       tool_glob,
     "search":     tool_search,
     "symbols":    tool_symbols,
     "write_file": tool_write_file,
     "edit_file":  tool_edit_file,
     "multi_edit": tool_multi_edit,
+    "apply_patch": tool_apply_patch,
     "notebook_edit": tool_notebook_edit,
+    "move_path": tool_move_path,
+    "delete_path": tool_delete_path,
     "run_bash":   tool_run_bash,
 }
 
 # Tools that change the world → require approval (unless YOLO).
-SIDE_EFFECTS = {"write_file", "edit_file", "multi_edit", "notebook_edit", "run_bash"}
+SIDE_EFFECTS = {"write_file", "edit_file", "multi_edit", "apply_patch", "notebook_edit",
+                "move_path", "delete_path", "run_bash"}
 
 TOOL_SCHEMAS = [
     {"type": "function", "function": {
@@ -1753,6 +2174,15 @@ TOOL_SCHEMAS = [
             "path":   {"type": "string", "description": "File path"},
             "offset": {"type": "integer", "description": "1-based start line (optional)"},
             "limit":  {"type": "integer", "description": "Max lines to read (optional)"},
+        }, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "view_image",
+        "description": ("Inspect a local image file using Hera's built-in image analysis "
+                        "(metadata plus OCR when available). Use this when an image on disk "
+                        "matters to the task or the multimodal route is unavailable."),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Image path"},
         }, "required": ["path"]},
     }},
     {"type": "function", "function": {
@@ -1821,6 +2251,15 @@ TOOL_SCHEMAS = [
         }, "required": ["path", "edits"]},
     }},
     {"type": "function", "function": {
+        "name": "apply_patch",
+        "description": ("Apply a multi-file patch in the standard *** Begin Patch / *** End Patch "
+                        "format. Use this for reliable multi-hunk or multi-file edits instead of "
+                        "many exact-string replacements."),
+        "parameters": {"type": "object", "properties": {
+            "patch": {"type": "string", "description": "Patch text beginning with *** Begin Patch"},
+        }, "required": ["patch"]},
+    }},
+    {"type": "function", "function": {
         "name": "notebook_edit",
         "description": ("Edit a Jupyter .ipynb cell. edit_mode 'replace' overwrites the cell at "
                         "cell_index, 'insert' adds a new cell at cell_index, 'delete' removes it. "
@@ -1833,6 +2272,25 @@ TOOL_SCHEMAS = [
                            "description": "Cell type for insert/replace (default code)"},
             "edit_mode":  {"type": "string", "enum": ["replace", "insert", "delete"],
                            "description": "Default replace"},
+        }, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "move_path",
+        "description": ("Rename or move a file or directory. Prefer this over run_bash mv so "
+                        "the move is checkpointed and can be undone."),
+        "parameters": {"type": "object", "properties": {
+            "source": {"type": "string", "description": "Existing file or directory"},
+            "destination": {"type": "string", "description": "New path"},
+            "overwrite": {"type": "boolean", "description": "Overwrite destination if it exists"},
+        }, "required": ["source", "destination"]},
+    }},
+    {"type": "function", "function": {
+        "name": "delete_path",
+        "description": ("Delete a file or directory. Prefer this over run_bash rm so deletion is "
+                        "checkpointed and can be undone."),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "File or directory to delete"},
+            "recursive": {"type": "boolean", "description": "Required for non-empty directories"},
         }, "required": ["path"]},
     }},
     {"type": "function", "function": {
@@ -1931,8 +2389,16 @@ def _narrate(name, args):
         return "Indexing code symbols"
     if name == "semantic_search":
         return f"Semantic-searching for {args.get('query', '')}"
+    if name == "view_image":
+        return f"Inspecting image {args.get('path', '')}"
     if name == "run_bash":
         return f"Running  {args.get('command', '')}"
+    if name == "apply_patch":
+        return "Applying a multi-file patch"
+    if name == "move_path":
+        return f"Moving {args.get('source', '')} to {args.get('destination', '')}"
+    if name == "delete_path":
+        return f"Deleting {args.get('path', '')}"
     if name == "install_tool":
         return f"Installing {args.get('program', '?')}"
     if name == "web_search":
@@ -1953,6 +2419,12 @@ def _preview_call(name, args):
         plan = _install_plan(prog) or "no package manager available"
         head = f"install {prog}" + (f"  {SYM_EMDASH} {reason}" if reason else "")
         return f"{head}\n    $ {plan}"
+    if name == "apply_patch":
+        patch = (args.get("patch", "") or "").splitlines()
+        head = patch[:40]
+        if len(patch) > 40:
+            head.append(f"{SYM_ELLIPSIS} (+{len(patch) - 40} more lines)")
+        return "apply patch\n" + "\n".join("    " + ln for ln in head)
     if name == "write_file":
         path = args.get("path", "?")
         c = args.get("content", "")
@@ -1995,7 +2467,141 @@ def _preview_call(name, args):
         mode = args.get("edit_mode", "replace")
         return (f"{mode} cell {args.get('cell_index', '?')} in {args.get('path', '?')}\n"
                 f"{_diff_preview('', args.get('new_source', ''))}")
+    if name == "move_path":
+        return (f"move {args.get('source', '?')} {SYM_ARROW_R} {args.get('destination', '?')}"
+                + (f"  {SYM_EMDASH} overwrite" if args.get("overwrite") else ""))
+    if name == "delete_path":
+        return (f"delete {args.get('path', '?')}"
+                + (f"  {SYM_EMDASH} recursive" if args.get("recursive") else ""))
     return f"{name}({json.dumps(args)})"
+
+
+def _proposed_edit(name, args):
+    """Return (path, before, after) for an edit tool without mutating the file.
+
+    Returns None when the proposed edit cannot be computed safely from the
+    current on-disk contents (e.g. missing path, malformed notebook, no match).
+    """
+    path = args.get("path", "")
+    if not path:
+        return None
+    resolved = _resolve(path)
+    existed, before = _snapshot(path)
+
+    if name == "write_file":
+        return resolved, (before or ""), args.get("content", "")
+
+    if not existed or before is None:
+        return None
+
+    if name == "edit_file":
+        old_s = args.get("old_string", "")
+        if old_s not in before:
+            return None
+        replace_all = bool(args.get("replace_all", False))
+        after = (before.replace(old_s, args.get("new_string", ""))
+                 if replace_all else before.replace(old_s, args.get("new_string", ""), 1))
+        return resolved, before, after
+
+    if name == "multi_edit":
+        after = before
+        edits = args.get("edits") or []
+        if not isinstance(edits, list) or not edits:
+            return None
+        for edit in edits:
+            if not isinstance(edit, dict):
+                return None
+            old_s = edit.get("old_string", "")
+            if not old_s or old_s not in after:
+                return None
+            replace_all = bool(edit.get("replace_all", False))
+            count = after.count(old_s)
+            if count > 1 and not replace_all:
+                replace_all = True
+            after = (after.replace(old_s, edit.get("new_string", ""))
+                     if replace_all else after.replace(old_s, edit.get("new_string", ""), 1))
+        return resolved, before, after
+
+    if name == "notebook_edit":
+        try:
+            with open(resolved, encoding="utf-8") as f:
+                nb = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        cells = nb.setdefault("cells", [])
+        n = len(cells)
+        mode = args.get("edit_mode", "replace")
+        cell_index = args.get("cell_index")
+        new_source = args.get("new_source", "")
+        cell_type = args.get("cell_type")
+        src_lines = new_source.splitlines(keepends=True) or ([new_source] if new_source else [])
+
+        def _mk(ctype):
+            cell = {"cell_type": ctype, "metadata": {}, "source": src_lines}
+            if ctype == "code":
+                cell["outputs"] = []
+                cell["execution_count"] = None
+            return cell
+
+        if mode == "delete":
+            if not isinstance(cell_index, int) or not (0 <= cell_index < n):
+                return None
+            cells.pop(cell_index)
+        elif mode == "insert":
+            idx = n if not isinstance(cell_index, int) else max(0, min(cell_index, n))
+            cells.insert(idx, _mk(cell_type or "code"))
+        else:
+            if not isinstance(cell_index, int) or not (0 <= cell_index < n):
+                return None
+            cell = cells[cell_index]
+            cell["source"] = src_lines
+            if cell_type:
+                cell["cell_type"] = cell_type
+            if cell.get("cell_type") == "code":
+                cell["outputs"] = []
+
+        after = json.dumps(nb, indent=1, ensure_ascii=False) + "\n"
+        return resolved, before, after
+
+    return None
+
+
+def _proposed_changes_for_tool(name, args):
+    if name in ("write_file", "edit_file", "multi_edit", "notebook_edit"):
+        proposed = _proposed_edit(name, args)
+        if proposed is None:
+            return []
+        path, before, after = proposed
+        return [{"kind": "write", "path": path, "before": before, "after": after,
+                 "existed": os.path.exists(path)}]
+    if name == "apply_patch":
+        changes, err = _simulate_apply_patch(args.get("patch", ""))
+        return changes if not err else []
+    if name == "move_path":
+        src = _resolve(args.get("source", ""))
+        dst = _resolve(args.get("destination", ""))
+        if not os.path.exists(src):
+            return []
+        existed, before = _snapshot(src)
+        dst_existed, dst_before = _snapshot(dst)
+        if not existed or before is None:
+            return []
+        return [{
+            "kind": "move_write",
+            "src": src,
+            "path": dst,
+            "before": before,
+            "after": before,
+            "dst_before": dst_before or "",
+            "dst_existed": dst_existed,
+        }]
+    if name == "delete_path":
+        path = _resolve(args.get("path", ""))
+        existed, before = _snapshot(path)
+        if not existed or before is None:
+            return []
+        return [{"kind": "delete", "path": path, "before": before, "existed": True}]
+    return []
 
 
 def _type_feedback():
@@ -2390,14 +2996,15 @@ def stream_turn(messages, spinner, tools=None, model_override=None):
     # return 5xx/connection errors. Retry a few times with backoff before giving
     # up, so one hiccup doesn't end the turn.
     global _VISION_WARNED
-    url, model, send_messages, downgraded = _select_endpoint(messages)
+    url, model, send_messages, downgraded, vision_mode = _select_endpoint(messages)
     if model_override:
         model = model_override
     if downgraded and not _VISION_WARNED:
         _VISION_WARNED = True
         spinner.stop()
-        print(f"{YELL}{SYM_WARN} image attached, but the current model is text-only {SYM_EMDASH} "
-              f"set HERA_VISION_URL to enable vision.{R}", file=sys.stderr)
+        print(f"{DIM}{SYM_HOOKED} image attached {SYM_EMDASH} using built-in local image analysis"
+              f"{' (set HERA_VISION_URL to override the route)' if not VISION_URL else ''}{R}",
+              file=sys.stderr)
 
     resp = None
     last_err = None
@@ -2428,6 +3035,17 @@ def stream_turn(messages, spinner, tools=None, model_override=None):
         except requests.exceptions.HTTPError as exc:
             last_err = exc
             code = exc.response.status_code if exc.response is not None else 0
+            if vision_mode == "endpoint":
+                url, model, send_messages, downgraded, vision_mode = _select_endpoint(
+                    messages, force_builtin=True)
+                if model_override:
+                    model = model_override
+                if not _VISION_WARNED:
+                    _VISION_WARNED = True
+                    spinner.stop()
+                    print(f"{DIM}{SYM_HOOKED} {_vision_fallback_notice()}{R}", file=sys.stderr)
+                    spinner.start()
+                continue
             # Self-heal a context-overflow 400: summarize the history and retry
             # once, so a big file read mid-task can't dead-end the turn.
             if (code == 400 and _is_context_overflow(exc)
@@ -2436,7 +3054,7 @@ def stream_turn(messages, spinner, tools=None, model_override=None):
                 print(f"{DIM}  context window full {SYM_EMDASH} compacting history and retrying{SYM_ELLIPSIS}{R}",
                       file=sys.stderr)
                 compact_history(messages)
-                url, model, send_messages, downgraded = _select_endpoint(messages)
+                url, model, send_messages, downgraded, vision_mode = _select_endpoint(messages)
                 if model_override:
                     model = model_override
                 compacted = True
@@ -2447,8 +3065,30 @@ def stream_turn(messages, spinner, tools=None, model_override=None):
                 print(f"{RED}[error] {exc}{R}\n", file=sys.stderr)
                 return None
         except requests.exceptions.ConnectionError as exc:
+            if vision_mode == "endpoint":
+                url, model, send_messages, downgraded, vision_mode = _select_endpoint(
+                    messages, force_builtin=True)
+                if model_override:
+                    model = model_override
+                if not _VISION_WARNED:
+                    _VISION_WARNED = True
+                    spinner.stop()
+                    print(f"{DIM}{SYM_HOOKED} {_vision_fallback_notice()}{R}", file=sys.stderr)
+                    spinner.start()
+                continue
             last_err = exc
         except requests.exceptions.Timeout as exc:
+            if vision_mode == "endpoint":
+                url, model, send_messages, downgraded, vision_mode = _select_endpoint(
+                    messages, force_builtin=True)
+                if model_override:
+                    model = model_override
+                if not _VISION_WARNED:
+                    _VISION_WARNED = True
+                    spinner.stop()
+                    print(f"{DIM}{SYM_HOOKED} {_vision_fallback_notice()}{R}", file=sys.stderr)
+                    spinner.start()
+                continue
             last_err = exc
         attempt += 1
         if attempt < 3:
@@ -2596,7 +3236,7 @@ def _account(usage):
 
 
 # ── Edit checkpoints / undo ───────────────────────────────────────────────────
-CHECKPOINTS = []  # stack of {path, existed, content, label}
+CHECKPOINTS = []  # stack of checkpoint objects (single-path or transaction)
 
 
 def _snapshot(path):
@@ -2612,23 +3252,95 @@ def _snapshot(path):
 
 
 def push_checkpoint(path, snap, label):
-    CHECKPOINTS.append({"path": _resolve(path), "existed": snap[0],
-                        "content": snap[1], "label": label})
+    CHECKPOINTS.append({
+        "kind": "file_restore",
+        "path": _resolve(path),
+        "existed": snap[0],
+        "content": snap[1],
+        "label": label,
+    })
+
+
+def push_transaction(ops, label):
+    CHECKPOINTS.append({"kind": "transaction", "ops": list(ops), "label": label})
+
+
+def _rm_path(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def _backup_path(path):
+    p = _resolve(path)
+    if not os.path.exists(p):
+        return None
+    root = tempfile.mkdtemp(prefix="hera-pathbak-")
+    dest = os.path.join(root, os.path.basename(p) or "backup")
+    if os.path.isdir(p) and not os.path.islink(p):
+        shutil.copytree(p, dest, symlinks=True)
+    else:
+        shutil.copy2(p, dest, follow_symlinks=False)
+    return dest
+
+
+def _cleanup_backup(backup_path):
+    if not backup_path:
+        return
+    root = os.path.dirname(backup_path)
+    try:
+        shutil.rmtree(root)
+    except OSError:
+        pass
+
+
+def _restore_backup(backup_path, target_path):
+    target = _resolve(target_path)
+    if os.path.exists(target):
+        _rm_path(target)
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    if os.path.isdir(backup_path) and not os.path.islink(backup_path):
+        shutil.copytree(backup_path, target, symlinks=True)
+    else:
+        shutil.copy2(backup_path, target, follow_symlinks=False)
+
+
+def _undo_checkpoint(cp):
+    kind = cp.get("kind", "file_restore")
+    if kind == "transaction":
+        msgs = []
+        for op in reversed(cp.get("ops") or []):
+            msgs.append(_undo_checkpoint(op))
+        return "; ".join(m for m in msgs if m)
+    if kind == "backup_restore":
+        try:
+            if cp.get("existed"):
+                _restore_backup(cp.get("backup"), cp["path"])
+                msg = f"restored {cp['path']} (undid {cp['label']})"
+            else:
+                if os.path.exists(cp["path"]):
+                    _rm_path(cp["path"])
+                msg = f"deleted {cp['path']} (undid {cp['label']})"
+        finally:
+            _cleanup_backup(cp.get("backup"))
+        return msg
+    p = cp["path"]
+    if cp["existed"]:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(cp["content"] or "")
+        return f"reverted {p} (undid {cp['label']})"
+    if os.path.exists(p):
+        _rm_path(p)
+    return f"deleted {p} (it was created by {cp['label']})"
 
 
 def undo_last():
     if not CHECKPOINTS:
         return "nothing to undo"
     cp = CHECKPOINTS.pop()
-    p = cp["path"]
     try:
-        if cp["existed"]:
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(cp["content"] or "")
-            return f"reverted {p} (undid {cp['label']})"
-        if os.path.exists(p):
-            os.remove(p)
-        return f"deleted {p} (it was created by {cp['label']})"
+        return _undo_checkpoint(cp)
     except OSError as exc:
         return f"[error] undo failed: {exc}"
 
@@ -2818,13 +3530,13 @@ def run_agent(messages, spinner):
             output = _exec_call(c)
             if c["name"] == "run_bash":
                 ran_command = True
-            elif c["name"] in _EDIT_TOOLS:
+            elif c["name"] in _EDIT_TOOLS or c["name"] in ("apply_patch", "move_path", "delete_path"):
                 edit_attempted = True
                 try:
                     cargs = json.loads(c["arguments"] or "{}")
                 except (json.JSONDecodeError, TypeError):
                     cargs = {}
-                if _is_code_file(cargs.get("path", "")):
+                if _tool_touches_code(c["name"], cargs):
                     edited_code = True
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": output})
 
@@ -3652,6 +4364,79 @@ def _skills_url():
     return base.rstrip("/") + "/skills"
 
 
+def _vision_status_url():
+    """The proxy's vision-status endpoint, derived from the API URL."""
+    base = API_URL[:-3] if API_URL.endswith("/v1") else API_URL
+    return base.rstrip("/") + "/vision-status"
+
+
+def fetch_vision_status(timeout=2.0):
+    """Fetch the proxy's vision readiness report, or (None, err) on failure."""
+    if not (API_URL and API_KEY):
+        return None, "no server or API key configured"
+    try:
+        r = requests.get(
+            _vision_status_url(),
+            timeout=timeout,
+            headers={"Authorization": f"Bearer {API_KEY}", "User-Agent": _WEB_UA},
+        )
+    except requests.exceptions.RequestException as exc:
+        return None, str(exc)
+    if not r.ok:
+        return None, f"{r.status_code}: {(r.text or '').strip()[:200]}"
+    try:
+        data = r.json()
+    except ValueError as exc:
+        return None, f"invalid JSON from proxy: {exc}"
+    return data, ""
+
+
+def _vision_banner_status():
+    """Short startup status for the banner, or None when it can't be checked."""
+    if not VISION_AUTO:
+        return ("override " + (VISION_URL or "(none)"), GREEN if VISION_URL else YELL)
+    data, _err = fetch_vision_status(timeout=1.2)
+    if not data:
+        return None
+    health = data.get("health") or {}
+    files = data.get("files") or {}
+    missing = [name for name in ("model", "mmproj")
+               if not (files.get(name) or {}).get("exists")]
+    if health.get("ok") and not missing:
+        return ("auto via proxy (healthy)", GREEN)
+    parts = []
+    if not health.get("ok"):
+        parts.append("server unhealthy")
+    if missing:
+        parts.append("missing " + ", ".join(missing))
+    return ("auto via proxy (" + "; ".join(parts or ["status unknown"]) + ")", YELL)
+
+
+def _vision_doctor_summary(timeout=4.0):
+    """Return (good, detail) for doctor output about vision readiness."""
+    if not VISION_URL:
+        return True, "built-in OCR/metadata only"
+    if not VISION_AUTO:
+        return True, f"override {VISION_URL}"
+    data, err = fetch_vision_status(timeout=timeout)
+    if not data:
+        return False, f"auto via proxy — status unavailable: {err}"
+    health = data.get("health") or {}
+    files = data.get("files") or {}
+    model_meta = files.get("model") or {}
+    mmproj_meta = files.get("mmproj") or {}
+    model_ok = bool(model_meta.get("exists"))
+    mmproj_ok = bool(mmproj_meta.get("exists"))
+    parts = [f"auto via proxy {SYM_EMDASH} {'healthy' if health.get('ok') else 'unhealthy'}"]
+    if data.get("model_alias"):
+        parts.append(data["model_alias"])
+    parts.append("model: " + ("present" if model_ok else "missing"))
+    parts.append("mmproj: " + ("present" if mmproj_ok else "missing"))
+    if health.get("error"):
+        parts.append("error: " + str(health.get("error"))[:120])
+    return bool(health.get("ok")) and model_ok and mmproj_ok, "  ".join(parts)
+
+
 def fetch_shared_skills():
     if not (API_URL and API_KEY):
         return None, "no server or API key configured"
@@ -4443,7 +5228,8 @@ def _expand_memory_imports(text, base_dir, seen, depth=0):
             if os.path.isfile(p) and p not in seen:
                 seen.add(p)
                 try:
-                    sub = open(p, encoding="utf-8", errors="replace").read()
+                    with open(p, encoding="utf-8", errors="replace") as f:
+                        sub = f.read()
                     out.append(f"<!-- imported: {m.group(1)} -->")
                     out.append(_expand_memory_imports(sub, os.path.dirname(p), seen, depth + 1))
                     continue
@@ -4462,7 +5248,8 @@ def load_memory():
             continue
         seen.add(rp)
         try:
-            body = open(path, encoding="utf-8", errors="replace").read()
+            with open(path, encoding="utf-8", errors="replace") as f:
+                body = f.read()
         except OSError:
             continue
         body = _expand_memory_imports(body, os.path.dirname(path), seen)[:MEMORY_MAX_PER_FILE]
@@ -4704,6 +5491,8 @@ def _run_doctor():
 
     print(f"    {ok_s if WEB_ENABLED else warn_s} web search  : "
           f"{'on (' + SEARCH_PROVIDER + ')' if WEB_ENABLED else 'off (HERA_NO_WEB=1)'}")
+    vision_ok, vision_detail = _vision_doctor_summary(timeout=4.0)
+    print(f"    {ok_s if vision_ok else warn_s} vision      : {vision_detail}")
 
     print(f"    {ok_s} MCP servers : {len(_mcp_clients)} connected")
     print(f"    {ok_s} memory      : {len(load_memory())} file(s) loaded")
@@ -4796,13 +5585,15 @@ def system_prompt():
         f"You are {NAME}, an agentic coding assistant running in a terminal. "
         f"You operate in the working directory: {os.getcwd()} (OS: {sys.platform}). "
         "You have tools to list directories, find files by glob, search file contents by "
-        "regex, index code definitions (symbols), read files, write files, edit files by "
-        "exact string replacement, and run shell commands. A semantic_search tool may also "
-        "be available for fuzzy 'where is the code thatSYM_ELLIPSIS' questions. "
+        "regex, index code definitions (symbols), read files, inspect local images, write files, "
+        "edit files by exact string replacement, apply multi-file patches, move/delete paths, "
+        "and run shell commands. A semantic_search tool may also be available for fuzzy "
+        "'where is the code thatSYM_ELLIPSIS' questions. "
         "Use glob/search/symbols to locate relevant code, then read files before changing "
-        "anything; make edits with precise old_string/new_string. File edits are revertible "
-        "by the user with /undo. For larger self-contained subtasks you may delegate to a "
-        "focused sub-agent with the task tool. "
+        "anything. Prefer apply_patch for multi-file or multi-hunk edits; use multi_edit for "
+        "several exact replacements in one file; use move_path/delete_path instead of shell mv/rm. "
+        "File edits are revertible by the user with /undo. For larger self-contained subtasks "
+        "you may delegate to a focused sub-agent with the task tool. "
         "Keep prose short SYM_EMDASH act with tools rather than describing what you would do. "
         "When the task is complete, give a brief summary of what you changed."
         "\n\n"
@@ -4867,6 +5658,9 @@ def system_prompt():
                  "a command SYM_EMDASH if it fails with 'command not found' the user is offered the "
                  "install and the command is retried automatically. Either way, don't give up "
                  "because a tool is missing.")
+    base += (" Image attachments are supported by default: if no full multimodal endpoint is "
+             "configured, Hera falls back to built-in local image analysis (metadata + OCR when "
+             "available). Use view_image for local image files when that context matters.")
     style = _output_style_text()
     if style:
         base += f"\n\nOutput style ({OUTPUT_STYLE}): {style}"
@@ -5052,6 +5846,9 @@ def print_banner():
         row("ext", f"{len(EXT_TOOLS)} mcp/custom tool(s)")
     if fn:
         row("context", fn, GREEN)
+    vision = _vision_banner_status()
+    if vision:
+        row("vision", vision[0], vision[1])
     row("tools", f"{len(TOOLS)} available")
     print(rule)
     print(f"  {DIM}type a task  {SYM_MIDDOT}  {R}{CYAN}@path{R}{DIM} to attach a file  {SYM_MIDDOT}  "
@@ -5560,10 +6357,11 @@ def print_help():
 #
 #   in : {"type":"prompt","text":...,"images":[dataURL,…]}
 #        | {"type":"approval","decision":"y|a|p|n","feedback":"…"}
+#        | {"type":"editor_apply_result","ok":bool,"error":"…"}
 #        | {"type":"plan","on":bool} | {"type":"plan_decision","decision":"yes|auto|no","feedback":"…"}
 #        | {"type":"auto","mode":…} | {"type":"logout"}
 #        | {"type":"interrupt"} | {"type":"undo"} | {"type":"clear"} | {"type":"exit"}
-#   out: ready | reasoning | token | narration | tool_start | proposed_diff
+#   out: ready | reasoning | token | narration | tool_start | proposed_diff | editor_apply_request
 #        | approval_request | plan_review | tool_end | turn_end | todos | suggestions
 #        | auto_mode | logged_out | info | error
 #
@@ -5572,6 +6370,7 @@ def print_help():
 # go to _APPROVAL_Q, an interrupt sets _INTERRUPT, everything else to _MAIN_Q.
 _MAIN_Q = queue.Queue()
 _APPROVAL_Q = queue.Queue()
+_EDITOR_APPLY_Q = queue.Queue()
 _SERVE_CLOSED = threading.Event()
 
 
@@ -5601,6 +6400,7 @@ def _serve_input_thread():
             _SERVE_CLOSED.set()
             _MAIN_Q.put(None)
             _APPROVAL_Q.put(None)
+            _EDITOR_APPLY_Q.put(None)
             return
         line = line.strip()
         if not line:
@@ -5614,6 +6414,8 @@ def _serve_input_thread():
             _INTERRUPT.set()
         elif t in ("approval", "plan_decision"):
             _APPROVAL_Q.put(msg)
+        elif t == "editor_apply_result":
+            _EDITOR_APPLY_Q.put(msg)
         elif t == "plan":
             global PLAN_MODE
             PLAN_MODE = bool(msg.get("on", not PLAN_MODE))
@@ -5659,11 +6461,11 @@ def _serve_stream(messages):
     global _VISION_WARNED
     if _is_anthropic():
         return _serve_anthropic(messages)
-    url, model, send_messages, downgraded = _select_endpoint(messages)
+    url, model, send_messages, downgraded, vision_mode = _select_endpoint(messages)
     if downgraded and not _VISION_WARNED:
         _VISION_WARNED = True
-        _emit({"type": "info", "text": "image attached, but the current model is "
-               "text-only SYM_EMDASH set HERA_VISION_URL to enable vision."})
+        _emit({"type": "info", "text": "image attached — using built-in local image analysis"
+               + ("" if VISION_URL else " (set HERA_VISION_URL to override the route)")})
     resp = None
     for compacted in (False, True):
         try:
@@ -5679,16 +6481,30 @@ def _serve_stream(messages):
             break
         except requests.exceptions.HTTPError as exc:
             code = exc.response.status_code if exc.response is not None else 0
+            if vision_mode == "endpoint":
+                url, model, send_messages, downgraded, vision_mode = _select_endpoint(
+                    messages, force_builtin=True)
+                if not _VISION_WARNED:
+                    _VISION_WARNED = True
+                    _emit({"type": "info", "text": _vision_fallback_notice()})
+                continue
             # Self-heal a context-overflow 400: summarize and retry once.
             if (code == 400 and _is_context_overflow(exc)
                     and not compacted and len(messages) > 2):
                 _emit({"type": "info", "text": "context window full SYM_EMDASH compacting and retryingSYM_ELLIPSIS"})
                 compact_history(messages)
-                url, model, send_messages, downgraded = _select_endpoint(messages)
+                url, model, send_messages, downgraded, vision_mode = _select_endpoint(messages)
                 continue
             _emit({"type": "error", "message": str(exc)})
             return None
         except requests.exceptions.RequestException as exc:
+            if vision_mode == "endpoint":
+                url, model, send_messages, downgraded, vision_mode = _select_endpoint(
+                    messages, force_builtin=True)
+                if not _VISION_WARNED:
+                    _VISION_WARNED = True
+                    _emit({"type": "info", "text": _vision_fallback_notice()})
+                continue
             _emit({"type": "error", "message": str(exc)})
             return None
     if resp is None:
@@ -5821,6 +6637,17 @@ def _serve_plan_approver(plan):
             return (d if d in ("yes", "auto", "no") else "no"), (msg.get("feedback") or "")
 
 
+def _serve_editor_apply(changes):
+    """Ask the editor host to apply a batch of filesystem changes natively."""
+    _emit({"type": "editor_apply_request", "changes": changes})
+    while True:
+        msg = _EDITOR_APPLY_Q.get()
+        if msg is None:
+            return False, "editor apply aborted (input closed)"
+        if msg.get("type") == "editor_apply_result":
+            return bool(msg.get("ok")), (msg.get("error") or "")
+
+
 def _serve_exec(c):
     name = c["name"]
     try:
@@ -5833,27 +6660,36 @@ def _serve_exec(c):
         out = f"[error] unknown tool: {name}"
         _emit({"type": "tool_end", "name": name, "error": True, "output": out})
         return out
-    # Show the change the editor *will* make before it's applied — compute the
-    # proposed before/after without touching the file.
-    if name in ("write_file", "edit_file"):
-        path = args.get("path", "")
-        existed, before = _snapshot(path)
-        after = None
-        if name == "write_file":
-            after = args.get("content", "")
-        else:
-            old_s, new_s = args.get("old_string", ""), args.get("new_string", "")
-            if existed and before is not None and old_s in before:
-                after = (before.replace(old_s, new_s) if args.get("replace_all")
-                         else before.replace(old_s, new_s, 1))
-        if after is not None:
-            _emit({"type": "proposed_diff", "path": _resolve(path),
-                   "before": (before or "")[:200_000], "after": after[:200_000]})
+    proposed_changes = _proposed_changes_for_tool(name, args)
+    # Show any textual before/after diff the editor can preview before apply.
+    for ch in proposed_changes:
+        if ch["kind"] in ("write", "move_write"):
+            _emit({"type": "proposed_diff", "path": ch["path"],
+                   "before": (ch.get("before") or "")[:200_000],
+                   "after": (ch.get("after") or "")[:200_000]})
     verdict = _serve_approve(name, args)
     if verdict is not True:
         out = f"[denied] {verdict}"
         _emit({"type": "tool_end", "name": name, "error": True, "output": out})
         return out
+    if proposed_changes and name in ("write_file", "edit_file", "multi_edit", "apply_patch",
+                                     "notebook_edit", "move_path", "delete_path"):
+        ok, err = _serve_editor_apply(proposed_changes)
+        if ok:
+            push_transaction(_checkpoints_for_changes(proposed_changes, name), name)
+            event = {"type": "tool_end", "name": name, "error": False,
+                     "output": f"applied natively in editor ({len(proposed_changes)} change(s))"}
+            if len(proposed_changes) == 1 and proposed_changes[0]["kind"] in ("write", "move_write"):
+                ch = proposed_changes[0]
+                event["diff"] = {
+                    "path": ch["path"],
+                    "before": (ch.get("before") or "")[:200_000],
+                    "after": (ch.get("after") or "")[:200_000],
+                }
+            _emit(event)
+            return event["output"]
+        if err:
+            _emit({"type": "info", "text": f"editor-native apply failed — falling back to CLI tools: {err}"})
     snap = _snapshot(args.get("path", "")) if name in _EDIT_TOOLS else None
     try:
         out = TOOLS[name](**args)
@@ -5957,13 +6793,13 @@ def _serve_run(messages):
             out = _serve_exec(c)
             if c["name"] == "run_bash":
                 ran_command = True
-            elif c["name"] in _EDIT_TOOLS:
+            elif c["name"] in _EDIT_TOOLS or c["name"] in ("apply_patch", "move_path", "delete_path"):
                 edit_attempted = True
                 try:
                     cargs = json.loads(c["arguments"] or "{}")
                 except (json.JSONDecodeError, TypeError):
                     cargs = {}
-                if _is_code_file(cargs.get("path", "")):
+                if _tool_touches_code(c["name"], cargs):
                     edited_code = True
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": out})
 
@@ -6063,7 +6899,9 @@ def serve_main():
     _emit({"type": "ready", "name": NAME, "model": MODEL, "cwd": os.getcwd(),
            "sandbox": sandbox_label(), "tools": list(TOOLS), "auto_mode": AUTO_MODE,
            "user": whoami_label() if (USER_EMAIL or USER_NAME) else "",
-           "vision": bool(VISION_URL), "needs_key": not bool(API_KEY)})
+           "vision": True, "vision_mode": ("endpoint" if VISION_URL else "builtin"),
+           "vision_auto": VISION_AUTO,
+           "needs_key": not bool(API_KEY)})
     while True:
         msg = _MAIN_Q.get()
         if msg is None:
@@ -6282,6 +7120,8 @@ def doctor():
             line(bool(USER_EMAIL or USER_NAME), "identity", whoami_label())
         except Exception:  # noqa: BLE001
             line(True, "identity", USER_ID)
+        vision_ok, vision_detail = _vision_doctor_summary(timeout=4.0)
+        line(vision_ok, "vision", vision_detail)
 
     line(True, "sandbox", sandbox_label())
     line(True, "context", f"auto-compacts near {CONTEXT_TOKENS} tok, and self-recovers on overflow")

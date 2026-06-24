@@ -44,7 +44,7 @@ automatically, or you can force one explicitly with `@skill:<id>` or `/skill <id
    ```
    (Or set `hera.command` in the extension settings to an absolute path — e.g.
    `~/.local/bin/hera`, or on Windows the full path to your `hera.py` launcher.) Confirm it's
-   found: `hera --version` should print `Hera 0.8.33`.
+   found: `hera --version` should print `Hera 0.8.45`.
 3. **Credentials.** Easiest: **run `hera` once in a terminal and paste your key** (see
    [`ACCESS_CLI.md`](ACCESS_CLI.md)). That saves `~/.config/hera/config.json` (endpoint + key +
    your resolved account email), and `hera --serve` — what the extension drives — reads that file
@@ -68,10 +68,10 @@ distributed as source (no Marketplace listing), so you load it locally:
 ```bash
 cd ide/vscode-hera
 npm install -g @vscode/vsce        # one-time: the VS Code packaging tool
-vsce package                       # produces hera-cli-0.3.4.vsix
+vsce package                       # produces hera-cli-0.3.5.vsix
 ```
 Then in VS Code: **Extensions → ⋯ (top-right) → Install from VSIX…** and pick the file. In Cursor
-the menu is the same. (You can also install from the CLI: `code --install-extension hera-cli-0.3.4.vsix`.)
+the menu is the same. (You can also install from the CLI: `code --install-extension hera-cli-0.3.5.vsix`.)
 
 ---
 
@@ -84,8 +84,7 @@ Open **Settings → Extensions → Hera** (or edit `settings.json`):
   "hera.command": "hera",
   "hera.serverUrl": "http://<HOST>:8090/v1",
   "hera.apiKey": "sk-your-open-webui-key",
-  "hera.showDiffs": true,
-  "hera.visionUrl": ""
+  "hera.showDiffs": true
 }
 ```
 
@@ -107,7 +106,7 @@ Open **Settings → Extensions → Hera** (or edit `settings.json`):
 | `hera.serverUrl` | `HERA_API_URL` | Identity proxy `http://<HOST>:8090/v1` (else from saved config). |
 | `hera.apiKey` | `HERA_API_KEY` | Your `sk-…` key (else from saved config / shell env). |
 | `hera.showDiffs` | — | Show the proposed-edit diff before applying (default `true`). |
-| `hera.visionUrl` | `HERA_VISION_URL` | A vision endpoint so attached images are actually analyzed. |
+| `hera.visionUrl` | `HERA_VISION_URL` | Optional override for image turns. The default stack already auto-routes images through `auth-proxy` to `vision-server`, with local OCR fallback if that route is unavailable. |
 | `hera.extraEnv` | any `HERA_*` | Extras like `HERA_YOLO`, `HERA_EMBED_URL`, `HERA_MAX_STEPS`. |
 
 ---
@@ -137,8 +136,9 @@ Open the **Command Palette** (`Ctrl/Cmd+Shift+P`) and type "Hera", or use the ke
   should do instead and it goes straight back to the model.
 - While Hera is generating, the **Send** button becomes **Stop** — click it to interrupt the turn.
 - **Attach an image** with the **📎** button, or **paste**/**drag-drop** one into the message box;
-  it shows as a thumbnail chip. The base model is text-only, so set `hera.visionUrl` (a vision
-  endpoint) to actually analyze images — otherwise they're attached but not interpreted.
+  it shows as a thumbnail chip. In the default stack those image turns are auto-routed through
+  `auth-proxy` to `vision-server`; if that route is unavailable, Hera falls back to local image
+  analysis (metadata + OCR when available). Set `hera.visionUrl` only to override that route.
 - The status line at the top shows **who you're signed in as** (👤 name + email, resolved from your
   key) along with the model and tools. To switch users, click the **⎟ sign-out** button (⎋) in the
   message bar: it forgets the key, asks for a different one, and reopens the panel as the new user.
@@ -192,6 +192,4 @@ Real today: chat panel with streaming thinking + step narration, proposed-edit d
 before they're applied, reject-with-feedback, Stop/interrupt, image attachments, LSP context,
 terminal commands, the live **Plan checklist**, **Next-step** suggestion chips, and **`$` cost** —
 plus everything the CLI gained (plan mode, hooks, permissions, custom commands/agents, background
-shell, remote MCP), since the panel drives the same `hera`. Not yet: applying edits through VS
-Code's own edit API (Hera writes to disk via its tools, shown as a diff), built-in vision (set
-`hera.visionUrl` to a vision endpoint), and a Marketplace listing.
+shell, remote MCP), since the panel drives the same `hera`. Not yet: a Marketplace listing.

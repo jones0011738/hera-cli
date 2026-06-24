@@ -14,7 +14,22 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.33`.
+- **Version:** `0.8.45`.
+- **Default vision backend:** image turns now go to the same API URL by default (`HERA_VISION_URL`
+  falls back to `HERA_API_URL`), so the standard stack can route them through a dedicated vision
+  backend without user setup.
+- **Safe OCR fallback preserved:** if the multimodal route fails (4xx/5xx, timeout, disconnect),
+  Hera retries the turn with built-in local image analysis (metadata + OCR when available) instead
+  of failing the request.
+- **Patch-native editing:** new `apply_patch` tool supports multi-file add/update/delete/move in an
+  `apply_patch`-style format, with undo-aware checkpoints.
+- **First-class filesystem mutations:** new `move_path` and `delete_path` tools replace the old
+  need to fall back to shell `mv`/`rm` for common file operations.
+- **Editor-native apply flow:** `hera --serve` now emits `editor_apply_request` batches so editor
+  clients can apply text writes, moves, and deletes natively, while Hera falls back to CLI-side
+  file writes when the editor rejects the batch.
+- **Vision readiness checks:** `hera doctor` now reports whether the default vision route is
+  healthy and whether the multimodal model/projector files are present.
 - **All limits removed** — no artificial execution or performance caps unless the user explicitly sets them:
   - `HERA_MAX_STEPS` default `0` (unlimited; was `25`). All three agentic loops (`run_turn`, `_serve_run`, `run_subagent`) use `while True` with `if MAX_STEPS and step >= MAX_STEPS: break`; the old `[stopped] hit MAX_STEPS=25` message only fires when the user sets a positive cap.
   - `HERA_MAX_TOOL_OUTPUT` default `0` (unlimited). Truncation only when set to a positive number.

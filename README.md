@@ -151,8 +151,10 @@ type, `↑`/`↓` move the highlight, `Tab`/`Enter` accept, `Esc` dismisses; a b
 everything.
 
 Reference files with **`@path`** to attach their contents — or an **image** (`@shot.png`,
-`.png/.jpg/.jpeg/.gif/.webp/.bmp`). The base model is text-only, so images are attached but only
-*interpreted* when you set `HERA_VISION_URL` to a vision endpoint (image turns route there).
+`.png/.jpg/.jpeg/.gif/.webp/.bmp`). By default Hera sends image turns to the same API URL as chat;
+if that route supports multimodal input, the image is analyzed there, and if it fails Hera falls
+back to built-in local OCR/metadata. Set `HERA_VISION_URL` only when you want to override the
+default image route.
 Every `write_file`/`edit_file` is checkpointed, so **`/undo`** rolls back the last one.
 
 As Hera works it **narrates each step** (`→ Editing app.py`) above the tool card, alongside its
@@ -305,8 +307,8 @@ the live catalog the proxy is serving.
 | `HERA_NO_SUGGESTIONS` | `0` | `1` = don't print "Next steps" tips after a task |
 | `HERA_PRICE_IN` / `HERA_PRICE_OUT` | `0` | USD per 1M input/output tokens → show `$` cost |
 | `HERA_CONTEXT_TOKENS` / `HERA_AUTO_COMPACT_AT` | `131072` / `0.8` | Auto-compact history near the context window. Server runs `--ctx-size 262144 --parallel 2` = 131072 tokens per slot; default matches exactly |
-| `HERA_VISION_URL` | _(empty)_ | Vision endpoint for attached images. Unset → images attached but not interpreted (text-only model) |
-| `HERA_VISION_MODEL` | = `HERA_MODEL` | Model name at `HERA_VISION_URL` |
+| `HERA_VISION_URL` | = `HERA_API_URL` | Optional override for attached-image turns. By default Hera uses the same API URL and falls back to local OCR/metadata if image inference fails |
+| `HERA_VISION_MODEL` | = `HERA_MODEL` | Optional model name override at `HERA_VISION_URL` |
 | `HERA_NO_COLOR` | `0` | `1` = disable colour/styling (also honours `NO_COLOR`) |
 | `HERA_FORCE_COLOR` | `0` | `1` = force colour even when output isn't a TTY |
 | `HERA_SANDBOX` | `auto` | `run_bash` sandbox: `auto` / `bwrap` / `unshare` / `none` |
@@ -327,16 +329,16 @@ the live catalog the proxy is serving.
 
 ## Updating
 
-Current release: **0.8.33**. On launch Hera checks the published version (at most once a day,
+Current release: **0.8.45**. On launch Hera checks the published version (at most once a day,
 fail-silent) and prints a one-line notice when a newer one is out:
 
 ```
-↑ update available: Hera 0.8.33 (you have 0.8.9)
+↑ update available: Hera 0.8.45 (you have 0.8.44)
   re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
 ```
 
 **The simplest way is `hera doctor`** — it updates Hera in place to the latest version and then
-runs a health check (endpoint, key, model, identity, sandbox). `hera doctor --force` re-downloads
+runs a health check (endpoint, key, model, identity, vision, sandbox). `hera doctor --force` re-downloads
 even when already current. To update manually, re-run the one-line installer or pull the single
 file directly:
 

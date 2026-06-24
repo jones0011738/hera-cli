@@ -220,10 +220,11 @@ Attach an image with `@path` (`.png/.jpg/.jpeg/.gif/.webp/.bmp`):
 ❯ what's wrong here? @error-screenshot.png
 ```
 
-The default Qwen model is **text-only**, so out of the box Hera attaches the image but tells you
-it can't interpret it. To actually analyze images, point Hera at a vision-capable
-OpenAI-compatible endpoint with `HERA_VISION_URL` (and `HERA_VISION_MODEL`); image turns are then
-routed there automatically.
+By default Hera sends image turns to the same API URL as chat. In this stack the `auth-proxy`
+detects image-bearing requests and routes them to the internal `vision-server` automatically. If
+that route is unavailable, Hera falls back to built-in local image analysis (metadata + OCR when
+available). Set `HERA_VISION_URL` only when you want to override the default route, and
+`HERA_VISION_MODEL` only when that override needs a different model name.
 
 ### Tools
 
@@ -393,8 +394,8 @@ chat is using.
 | `HERA_NO_SUGGESTIONS` | `0` | `1` = don't print "Next steps" tips after a task. |
 | `HERA_PRICE_IN` / `HERA_PRICE_OUT` | `0` | USD per 1M input/output tokens → show `$` cost. |
 | `HERA_CONTEXT_TOKENS` / `HERA_AUTO_COMPACT_AT` | `131072` / `0.8` | Auto-compact history near the context window (131072 matches the model's actual context window). |
-| `HERA_VISION_URL` | _(empty)_ | Vision endpoint for attached images. Unset → images attached but not interpreted (text-only model). |
-| `HERA_VISION_MODEL` | = `HERA_MODEL` | Model name at `HERA_VISION_URL`. |
+| `HERA_VISION_URL` | = `HERA_API_URL` | Optional override for attached-image turns. By default Hera uses the same API URL and falls back to local OCR/metadata if image inference fails. |
+| `HERA_VISION_MODEL` | = `HERA_MODEL` | Optional model name override for `HERA_VISION_URL`. |
 | `HERA_NO_COLOR` / `HERA_FORCE_COLOR` | `0` | Disable / force colour. |
 | `HERA_SANDBOX` | `auto` | `auto` / `bwrap` / `unshare` / `none`. |
 | `HERA_SANDBOX_NET` | `1` | `0` = block network in the sandbox. |
@@ -409,36 +410,38 @@ chat is using.
 
 ## 6. Keeping Hera up to date
 
-The current release is **0.8.33**. On launch Hera checks the published version (at most once a
+The current release is **0.8.45**. On launch Hera checks the published version (at most once a
 day, fail-silent — it never blocks or errors startup). If a newer one is out, you'll see a
 one-line notice like:
 
 ```
-↑ update available: Hera 0.8.33 (you have 0.8.9)
+↑ update available: Hera 0.8.45 (you have 0.8.44)
   re-run the installer, or:  curl -fsSL <download_url> -o "$(command -v hera || echo ~/.local/bin/hera)"
 ```
 
 **Easiest — just run `hera doctor`.** It updates Hera to the latest version in place and then runs
-a quick health check (endpoint, key, model, identity, sandbox):
+a quick health check (endpoint, key, model, identity, vision, sandbox):
 
 ```
 $ hera doctor
 
 ▌ Hera doctor  · update + health check
 
-  ✓ update       updated v0.8.9 → v0.8.33  ·  ~/.local/bin/hera
+  ✓ update       updated v0.8.44 → v0.8.45  ·  ~/.local/bin/hera
   ✓ endpoint     http://<HOST>:8090/v1
   ✓ api key      set
   ✓ model        qwen3.6-35b-a3b — HTTP 200
   ✓ identity     Your Name (you@example.com)
+  ✓ vision       auto via proxy — healthy  qwen2.5-vl-7b-instruct  model: present  mmproj: present
   ✓ sandbox      bwrap — fs confined to cwd, network on
   ✓ context      auto-compacts near 131072 tok, and self-recovers on overflow
 ```
 
 The **identity** line shows the real account the key belongs to (your name + email, fetched live
-from `/whoami`) — so every surface greets *you*. `hera doctor --force` re-downloads even if you're
-already current. Or update manually — re-run the one-line installer from step 2, or pull the latest
-single file:
+from `/whoami`) — so every surface greets *you*. The **vision** line checks the default multimodal
+route through `auth-proxy`, including whether `vision-server` is healthy and whether its model +
+projector files are present. `hera doctor --force` re-downloads even if you're already current. Or
+update manually — re-run the one-line installer from step 2, or pull the latest single file:
 
 ```bash
 curl -fsSL http://<HOST>:8081/hera.py -o "$(command -v hera || echo ~/.local/bin/hera)"

@@ -14,7 +14,12 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.45`.
+- **Version:** `0.8.47`.
+- **Model is a reasoning model** — `qwen3.6-35b-a3b` returns `reasoning_content` (thinking) separately
+  from `content` (final answer), thinking first. With a small `max_tokens` the budget can be spent on
+  reasoning before any `content` is produced, so `content` comes back empty with `finish_reason=length`
+  — not a fault, just needs more headroom (`max_tokens >= 200` when smoke-testing). `completion_tokens`
+  counts the reasoning tokens too. Hera renders/collapses the think block; raw `/v1` callers get both fields.
 - **Server-side context-fit backstop (proxy):** independent of the CLI's own auto-compaction, the
   identity proxy now guarantees every forwarded prompt fits the model's context window — it counts
   tool-schema tokens, reserves room for the reply, and self-calibrates from llama.cpp's exact token

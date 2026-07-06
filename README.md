@@ -329,7 +329,7 @@ the live catalog the proxy is serving.
 
 ## Updating
 
-Current release: **0.8.45**. On launch Hera checks the published version (at most once a day,
+Current release: **0.8.47**. On launch Hera checks the published version (at most once a day,
 fail-silent) and prints a one-line notice when a newer one is out:
 
 ```

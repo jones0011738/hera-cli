@@ -351,7 +351,10 @@ Your config and saved sessions are untouched. Silence the notice with `HERA_NO_U
 **Context limits are handled automatically.** When a long session or a large file read approaches
 the model's context window, Hera auto-compacts the conversation (and self-heals a context-overflow
 error by compacting and retrying), so you won't hit the old `400 … exceeds the available context
-size` failure.
+size` failure. There's also a server-side backstop: the identity proxy guarantees every forwarded
+prompt fits the model's context window (it counts tool schemas, reserves room for the reply, and
+self-calibrates on overflow), so the CLI, editor clients, and web chat are all protected even if a
+request slips past the client-side estimate.
 
 ---
 

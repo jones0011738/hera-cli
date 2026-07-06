@@ -15,6 +15,14 @@ aiming for Claude-Code-class behavior.
 
 ## Latest changes
 - **Version:** `0.8.45`.
+- **Server-side context-fit backstop (proxy):** independent of the CLI's own auto-compaction, the
+  identity proxy now guarantees every forwarded prompt fits the model's context window — it counts
+  tool-schema tokens, reserves room for the reply, and self-calibrates from llama.cpp's exact token
+  count on overflow. So even if the client-side estimate under-shoots, the request is pruned rather
+  than failing with `400 … exceeds the available context size`. This protects the CLI, editor
+  clients, **and** web chat uniformly. (Web chat additionally gets a rolling-summary OWUI filter so
+  long browser conversations are condensed like the CLI compacts.) See repo `HERA.md` /
+  `docs/OWUI_SUMMARIZATION.md`.
 - **Default vision backend:** image turns now go to the same API URL by default (`HERA_VISION_URL`
   falls back to `HERA_API_URL`), so the standard stack can route them through a dedicated vision
   backend without user setup.

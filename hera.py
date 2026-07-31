@@ -156,7 +156,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.53"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.54"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -1262,8 +1262,23 @@ def tool_list_dir(path="."):
     return f"{p}:\n" + "\n".join(lines)
 
 
+# Optional hook: an ACP client can serve file reads from its (unsaved) editor
+# buffers via fs/read_text_file. Set by acp_main when the client supports it.
+_READ_FILE_HOOK = None
+
+
 def tool_read_file(path, offset=None, limit=None):
     p = _resolve(path)
+    # When an ACP client exposes its editor buffers (fs/read_text_file), prefer
+    # the (possibly unsaved) buffer over disk for a full read. Best-effort: any
+    # miss/None falls through to the normal on-disk read below.
+    if _READ_FILE_HOOK is not None and offset is None and limit is None:
+        try:
+            buf = _READ_FILE_HOOK(p)
+        except Exception:  # noqa: BLE001
+            buf = None
+        if isinstance(buf, str):
+            return buf[:MAX_READ_BYTES]
     if not os.path.isfile(p):
         return f"[error] no such file: {p}"
     low = p.lower()
@@ -6927,7 +6942,8 @@ def _serve_plan_approver(plan):
 
 
 def _serve_editor_apply(changes):
-    """Ask the editor host to apply a batch of filesystem changes natively."""
+    """Ask the editor host to apply a batch of filesystem changes natively (the
+    bespoke --serve protocol). Returns (ok, error)."""
     _emit({"type": "editor_apply_request", "changes": changes})
     while True:
         msg = _EDITOR_APPLY_Q.get()
@@ -6935,6 +6951,12 @@ def _serve_editor_apply(changes):
             return False, "editor apply aborted (input closed)"
         if msg.get("type") == "editor_apply_result":
             return bool(msg.get("ok")), (msg.get("error") or "")
+
+
+# Pluggable native-apply backend: the bespoke --serve editor host by default;
+# the ACP front-end swaps in _acp_editor_apply (fs/write_text_file) when the
+# client advertises the capability.
+_EDITOR_APPLY_FN = _serve_editor_apply
 
 
 def _serve_exec(c):
@@ -6966,7 +6988,7 @@ def _serve_exec(c):
     if proposed_changes and not _NONINTERACTIVE and _EDITOR_NATIVE_APPLY and \
             name in ("write_file", "edit_file", "multi_edit", "apply_patch",
                      "notebook_edit", "move_path", "delete_path"):
-        ok, err = _serve_editor_apply(proposed_changes)
+        ok, err = _EDITOR_APPLY_FN(proposed_changes)
         if ok:
             push_transaction(_checkpoints_for_changes(proposed_changes, name), name)
             event = {"type": "tool_end", "name": name, "error": False,
@@ -7496,8 +7518,56 @@ def _acp_prompt_to_text(blocks):
     return "\n".join(p for p in parts if p), images
 
 
+def _acp_editor_apply(changes):
+    """Native file apply for ACP: write each change through the client via
+    fs/write_text_file. Only plain writes are supported over ACP fs; a batch with
+    a move/delete returns (False, reason) so _serve_exec falls back to CLI tools."""
+    peer, sid = _ACP["peer"], _ACP["session_id"]
+    if not peer or not sid:
+        return False, "no ACP session"
+    for ch in changes:
+        if ch.get("kind") != "write":
+            return False, f"ACP fs cannot apply a '{ch.get('kind')}' change"
+        _result, err = peer.request("fs/write_text_file", {
+            "sessionId": sid, "path": ch.get("path", ""), "content": ch.get("after") or ""})
+        if err:
+            return False, (err.get("message") if isinstance(err, dict) else str(err))
+    return True, ""
+
+
+def _acp_read_text_file(path):
+    """Read a file through the ACP client (its editor buffer). Returns the text,
+    or None on any error so the caller falls back to reading from disk."""
+    peer, sid = _ACP["peer"], _ACP["session_id"]
+    if not peer or not sid:
+        return None
+    result, err = peer.request("fs/read_text_file", {"sessionId": sid, "path": path})
+    if err or not isinstance(result, dict):
+        return None
+    content = result.get("content")
+    return content if isinstance(content, str) else None
+
+
+def _acp_replay_session(sid, msgs):
+    """Stream a loaded session's history back to the client as session/update
+    chunks (used by session/load)."""
+    peer = _ACP["peer"]
+    for m in msgs:
+        role = m.get("role")
+        text = _text_of(m.get("content"))
+        if not text:
+            continue
+        if role == "user":
+            peer.notify("session/update", {"sessionId": sid, "update": {
+                "sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": text}}})
+        elif role == "assistant":
+            peer.notify("session/update", {"sessionId": sid, "update": {
+                "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}})
+
+
 def acp_main():
     global _EMIT_SINK, _EDITOR_NATIVE_APPLY, _PLAN_APPROVER, _INSTALL_APPROVER
+    global _EDITOR_APPLY_FN, _READ_FILE_HOOK
     resolve_identity()
     register_extensions(quiet=True)
     peer = AcpPeer(sys.stdout)
@@ -7509,8 +7579,17 @@ def acp_main():
     sessions = {}                            # sessionId -> messages
 
     def on_initialize(params):
+        # Honour the client's fs capabilities: route native file apply through
+        # fs/write_text_file and file reads through fs/read_text_file when offered.
+        global _EDITOR_NATIVE_APPLY, _EDITOR_APPLY_FN, _READ_FILE_HOOK
+        fs = ((params.get("clientCapabilities") or {}).get("fs")) or {}
+        if fs.get("writeTextFile"):
+            _EDITOR_NATIVE_APPLY = True
+            _EDITOR_APPLY_FN = _acp_editor_apply
+        if fs.get("readTextFile"):
+            _READ_FILE_HOOK = _acp_read_text_file
         return {"protocolVersion": ACP_PROTOCOL_VERSION,
-                "agentCapabilities": {"loadSession": False,
+                "agentCapabilities": {"loadSession": True,
                                       "promptCapabilities": {"image": True, "embeddedContext": True}},
                 "authMethods": []}
 
@@ -7521,6 +7600,25 @@ def acp_main():
         sid = new_session_id()
         sessions[sid] = [{"role": "system", "content": system_prompt()}]
         return {"sessionId": sid}
+
+    def on_load(params):
+        # Resume a saved conversation: load it, register it under the requested
+        # sessionId, and replay its history to the client before returning.
+        sid = params.get("sessionId")
+        if not sid:
+            raise RuntimeError("session/load requires a sessionId")
+        saved = load_session(sid)
+        if saved is None:
+            raise RuntimeError(f"no saved session: {sid}")
+        msgs = saved.get("messages") or [{"role": "system", "content": system_prompt()}]
+        sessions[sid] = msgs
+        _ACP["session_id"] = sid
+        CURRENT_SESSION["id"] = sid
+        CURRENT_SESSION["created"] = saved.get("created")
+        CURRENT_SESSION["title"] = saved.get("title") or _first_user(msgs)
+        SESSION.update(saved.get("tokens", {}))
+        _acp_replay_session(sid, msgs)
+        return {}
 
     def on_prompt(params):
         sid = params.get("sessionId")
@@ -7547,6 +7645,7 @@ def acp_main():
         "initialize": on_initialize,
         "authenticate": on_authenticate,
         "session/new": on_new,
+        "session/load": on_load,
         "session/prompt": on_prompt,
         "session/cancel": on_cancel,
     })
@@ -7610,6 +7709,20 @@ def _tui_graph_lines(nodes):
         rows.append((glyph, f"g_{n.get('status', 'pending')}",
                      f"{n.get('id', '')} {n.get('title', '')}"))
     return rows
+
+
+def _tui_node_detail(graph_nodes, idx):
+    """Build a detail-popup modal for the task-graph node at `idx`, pulling the
+    node's full result from the live PLAN_GRAPH (the sidebar snapshot omits it)."""
+    if not (0 <= idx < len(graph_nodes)):
+        return None
+    n = graph_nodes[idx]
+    nid = n.get("id")
+    full = next((g for g in PLAN_GRAPH if g.get("id") == nid), None)
+    status = (full or n).get("status", "pending")
+    result = (full or {}).get("result") or "(no result yet — this node hasn't run)"
+    return {"kind": "detail", "title": f"[{nid}] {n.get('title', '')} ({status})",
+            "body": str(result), "scroll": 0}
 
 
 class TuiModel:
@@ -7737,6 +7850,26 @@ def _tui_addstr(win, y, x, text, attr=0):
 def _tui_draw_modal(stdscr, modal):
     import curses
     h, w = stdscr.getmaxyx()
+    if modal["kind"] == "detail":
+        # Scrollable popup for a clicked task-graph node's full result.
+        bw = min(w - 2, 78)
+        wrapped = _tui_wrap(modal.get("body", ""), bw - 4)
+        bh = min(h - 2, max(6, len(wrapped) + 4))
+        inner = max(1, bh - 4)                       # body rows between title and hint
+        sc = max(0, min(modal.get("scroll", 0), max(0, len(wrapped) - inner)))
+        modal["scroll"] = sc
+        by, bx = (h - bh) // 2, (w - bw) // 2
+        for i in range(bh):
+            _tui_addstr(stdscr, by + i, bx, " " * bw, curses.A_REVERSE)
+        _tui_addstr(stdscr, by + 1, bx + 2, modal.get("title", "Detail")[:bw - 4],
+                    curses.A_REVERSE | curses.A_BOLD)
+        for i, l in enumerate(wrapped[sc:sc + inner]):
+            _tui_addstr(stdscr, by + 2 + i, bx + 2, l[:bw - 4], curses.A_REVERSE)
+        pos = f"   ({sc + 1}-{min(sc + inner, len(wrapped))}/{len(wrapped)})" if len(wrapped) > inner else ""
+        _tui_addstr(stdscr, by + bh - 1, bx + 2,
+                    f"[{SYM_ARROW_U}/{SYM_ARROW_D}] scroll   [Esc] close{pos}"[:bw - 4],
+                    curses.A_REVERSE | curses.A_DIM)
+        return
     if modal["kind"] == "approval":
         obj = modal["obj"]
         title = f"Approve {obj.get('name', 'tool')}?"
@@ -7758,6 +7891,19 @@ def _tui_draw_modal(stdscr, modal):
 
 
 def _tui_handle_modal_key(modal, ch, model):
+    import curses
+    if modal["kind"] == "detail":
+        if ch == curses.KEY_UP:
+            modal["scroll"] = max(0, modal.get("scroll", 0) - 1)
+        elif ch == curses.KEY_DOWN:
+            modal["scroll"] = modal.get("scroll", 0) + 1
+        elif ch == curses.KEY_PPAGE:
+            modal["scroll"] = max(0, modal.get("scroll", 0) - 5)
+        elif ch == curses.KEY_NPAGE:
+            modal["scroll"] = modal.get("scroll", 0) + 5
+        elif ch in (27, ord('q'), ord('Q'), curses.KEY_ENTER, 10, 13):
+            modal["done"] = True
+        return
     if modal["kind"] == "approval":
         d = {ord('y'): "y", ord('Y'): "y", ord('a'): "a", ord('A'): "a",
              ord('n'): "n", ord('N'): "n", 27: "n"}.get(ch)
@@ -7818,6 +7964,8 @@ def _tui_run(stdscr, messages):
     model.add_line(f"{NAME} {VERSION} — fullscreen TUI. Type a message, Enter to send. "
                    f"PgUp/PgDn or wheel scrolls; Ctrl-C interrupts; Esc/Ctrl-D quits.", "info")
     modal = None
+    graph_hit = {}          # screen row (y) → node index, for click-to-open
+    layout = {"gx0": 1 << 30}
 
     def start_turn(text):
         model.add_line(f"{SYM_PROMPT} {text}", "user")
@@ -7852,14 +8000,18 @@ def _tui_run(stdscr, messages):
         top = max(0, len(rows) - body_h - model.scroll)
         for i, (style, text) in enumerate(rows[top: top + body_h]):
             _tui_addstr(stdscr, 1 + i, 0, text[:body_w], STYLE.get(style, 0))
+        graph_hit.clear()
         if show_graph:
             gx = body_w + 1
+            layout["gx0"] = body_w
             for i in range(1, h - 1):
                 _tui_addstr(stdscr, i, body_w, "│", curses.A_DIM)
             gy = 1
-            for glyph, style, text in _tui_graph_lines(model.graph):
+            for ridx, (glyph, style, text) in enumerate(_tui_graph_lines(model.graph)):
                 line = (f"{glyph} {text}" if glyph else text)[:gw - 1]
                 _tui_addstr(stdscr, gy, gx, line, STYLE.get(style, 0))
+                if ridx >= 1:                       # ridx 0 is the header row
+                    graph_hit[gy] = ridx - 1        # map screen row → node index
                 gy += 1
                 if gy >= h - 1:
                     break
@@ -7999,6 +8151,12 @@ def _tui_run(stdscr, messages):
                     model.scroll += 3
                 elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
                     model.scroll = max(0, model.scroll - 3)
+                elif (bstate & getattr(curses, "BUTTON1_CLICKED", 0)
+                      or bstate & getattr(curses, "BUTTON1_PRESSED", 0)):
+                    if _my in graph_hit and _mx >= layout.get("gx0", 1 << 30):
+                        d = _tui_node_detail(model.graph, graph_hit[_my])
+                        if d:
+                            modal = d
             except Exception:  # noqa: BLE001
                 pass
         elif 32 <= ch < 127:

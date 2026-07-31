@@ -14,7 +14,12 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.53`.
+- **Version:** `0.8.54`.
+- **ACP editor-native files + session resume.** `--acp` honours the client's `fs` capabilities: applies
+  edits via `fs/write_text_file` and reads open buffers via `fs/read_text_file` when offered; advertises
+  `loadSession` and replays a resumed conversation to the client. A full guide to the Grok-parity features
+  lives in `docs/GROK_PARITY.md`.
+- **TUI:** click a task-graph node in `--tui` to open a scrollable popup with that node's full result.
 - **`/resume <n>` now selects by the list number** shown in `/resume`/`/sessions` (newest first), not just
   by session id; `/resume` also falls back to listing sessions from all projects when the current directory
   has none, so it's never a dead end.

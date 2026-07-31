@@ -14,7 +14,10 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.52`.
+- **Version:** `0.8.53`.
+- **`/resume <n>` now selects by the list number** shown in `/resume`/`/sessions` (newest first), not just
+  by session id; `/resume` also falls back to listing sessions from all projects when the current directory
+  has none, so it's never a dead end.
 - **Fullscreen TUI.** `hera --tui` opens a curses UI: scrollback + input + status bar + a live task-graph
   sidebar (updates as `plan_graph`/`run_plan_graph` run). Wheel/PgUp-PgDn scroll, Ctrl-C interrupts,
   Esc/Ctrl-D quits; approvals appear as modal prompts. No extra dependency; falls back to the plain

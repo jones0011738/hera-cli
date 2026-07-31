@@ -156,7 +156,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.52"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.53"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -4956,25 +4956,44 @@ def _switch_to(messages, s):
     print()
 
 
+def _resume_list():
+    """The sessions `/resume` offers, newest first, and a label for their scope.
+    This project's sessions when it has any; otherwise all sessions, so `/resume`
+    is never a dead end when run from a directory with no history of its own."""
+    all_s = list_sessions()
+    proj = [s for s in all_s if _same_project(s)]
+    return (proj, "this project") if proj else (all_s, "all projects")
+
+
+def _resolve_resume(arg):
+    """Resolve a `/resume` argument to a saved session. A small integer picks by
+    the list number shown in the picker/`/sessions` (the #1 source of confusion —
+    those numbers now work); anything else is treated as a session id or prefix
+    (or '__latest__')."""
+    arg = (arg or "").strip()
+    shown = _resume_list()[0][:20]
+    if arg.isdigit():
+        i = int(arg)
+        if 1 <= i <= len(shown):
+            return shown[i - 1]
+    return load_session(arg)
+
+
 def resume_picker(messages):
-    """Show this project's recent conversations and let the user pick one."""
-    all_sessions = list_sessions()
-    sessions = [s for s in all_sessions if _same_project(s)]
+    """Show recent conversations and let the user pick one by number."""
+    sessions, scope = _resume_list()
     if not sessions:
-        other = len(all_sessions)
-        if other:
-            print(f"\n{DIM}no conversations in this project yet "
-                  f"({other} in other projects {SYM_EMDASH} `hera --list-sessions` to see all).{R}\n")
-        else:
-            print(f"\n{DIM}no saved conversations yet.{R}\n")
+        print(f"\n{DIM}no saved conversations yet.{R}\n")
         return
     shown = sessions[:20]
-    print(f"\n{BOLD}Resume a conversation{R} {DIM}(this project, newest first){R}")
+    print(f"\n{BOLD}Resume a conversation{R} {DIM}({scope}, newest first){R}")
     for i, s in enumerate(shown, 1):
         msgs = s.get("messages", [])
         nturns = sum(1 for m in msgs if m.get("role") == "user")
+        proj = os.path.basename((s.get("cwd") or "").rstrip("/")) or "~"
+        tail = f" {SYM_MIDDOT} {proj}/" if scope == "all projects" else ""
         print(f"  {ACCENT}{i:>2}.{R} {_session_label(s)}")
-        print(f"      {DIM}{(s.get('updated','') or '')[:16]} {SYM_MIDDOT} {nturns} message(s){R}")
+        print(f"      {DIM}{(s.get('updated','') or '')[:16]} {SYM_MIDDOT} {nturns} message(s){tail}{R}")
     try:
         ans = input(f"\n{BOLD}  number to resume (Enter to cancel):{R} ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -7924,6 +7943,33 @@ def _tui_run(stdscr, messages):
             if low == "/undo":
                 model.add_line(undo_last(), "info")
                 continue
+            if low == "/resume" or low.startswith("/resume "):
+                arg = text.split(" ", 1)[1].strip() if " " in text else ""
+                shown, scope = _resume_list()
+                if not arg:
+                    if not shown:
+                        model.add_line("no saved conversations yet", "info")
+                    else:
+                        model.add_line(f"Resume ({scope}) — type /resume <n>:", "info")
+                        for i, s in enumerate(shown[:20], 1):
+                            model.add_line(f"  {i}. {_session_label(s)}", "info")
+                    continue
+                s = _resolve_resume(arg)
+                if not s:
+                    model.add_line(f"no session matching {arg!r}", "info")
+                    continue
+                save_session(messages)
+                messages[:] = s["messages"]
+                CURRENT_SESSION["id"] = s["id"]
+                CURRENT_SESSION["created"] = s.get("created")
+                CURRENT_SESSION["title"] = s.get("title") or _first_user(s.get("messages") or [])
+                SESSION.update(s.get("tokens", {}))
+                _always_ok.clear()
+                reset_turn_marks()
+                model.lines, model.graph, model._stream_style = [], [], None
+                model.add_line(f"resumed: {_session_label(s)} "
+                               f"({sum(1 for m in messages if m.get('role') == 'user')} message(s))", "info")
+                continue
             start_turn(text)
             continue
         if ch in (curses.KEY_BACKSPACE, 127, 8):
@@ -8412,7 +8458,7 @@ def _repl(messages, spinner):
             continue
         if cmd.startswith("/resume "):
             sid = user_input[8:].strip()
-            s = load_session(sid)
+            s = _resolve_resume(sid)
             if s:
                 _switch_to(messages, s)
             else:

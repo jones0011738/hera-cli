@@ -156,7 +156,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.50"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.51"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -6651,6 +6651,10 @@ _EMIT_SINK = _default_emit
 # When True (headless -p without a TTY), tool approvals can't prompt — they're
 # auto-denied unless YOLO / auto-mode / allowlist already granted them.
 _NONINTERACTIVE = False
+# Editor-native file apply (emit editor_apply_request and wait for the host).
+# The bespoke --serve front-end uses it; the ACP front-end turns it off so file
+# writes go through the CLI tools directly (ACP fs/* is not wired up yet).
+_EDITOR_NATIVE_APPLY = True
 
 
 def _emit(obj):
@@ -6940,7 +6944,7 @@ def _serve_exec(c):
         return out
     # Editor-native apply needs a live editor host answering editor_apply_result;
     # headless -p has none, so it must write via CLI tools or it deadlocks.
-    if proposed_changes and not _NONINTERACTIVE and \
+    if proposed_changes and not _NONINTERACTIVE and _EDITOR_NATIVE_APPLY and \
             name in ("write_file", "edit_file", "multi_edit", "apply_patch",
                      "notebook_edit", "move_path", "delete_path"):
         ok, err = _serve_editor_apply(proposed_changes)
@@ -7206,6 +7210,333 @@ def serve_main():
     close_extensions()
 
 
+# ── ACP (Agent Client Protocol) front-end ────────────────────────────────────
+# A second headless front-end onto the same agent engine (_serve_run), speaking
+# newline-delimited JSON-RPC 2.0 over stdio — Zed's Agent Client Protocol — so ACP
+# editors/orchestrators can drive Hera and it can run alongside other ACP agents.
+# The bespoke --serve protocol above is unchanged; ACP reuses _serve_run/_serve_exec
+# by swapping the emit sink (_acp_emit) and routing tool-permission prompts to
+# outbound session/request_permission requests (via _APPROVAL_Q, so all of
+# _serve_approve's gating — perm rules, hooks, auto mode — is reused verbatim).
+ACP_PROTOCOL_VERSION = 1
+
+
+class AcpPeer:
+    """Minimal bidirectional JSON-RPC 2.0 peer over newline-delimited JSON.
+
+    Handles inbound requests/notifications (via `handlers`) and correlates the
+    responses to our own outbound requests. Inbound requests run in their own
+    thread so a long handler (session/prompt) doesn't block the reader from
+    delivering permission responses and cancel notifications — set
+    `async_requests=False` in tests to dispatch inline."""
+
+    def __init__(self, outfile):
+        self._out = outfile
+        self._wlock = threading.Lock()
+        self._id = 0
+        self._id_lock = threading.Lock()
+        self._pending = {}          # outbound id -> Queue awaiting the response
+        self.handlers = {}          # method -> callable(params)
+        self.async_requests = True
+
+    def _write(self, obj):
+        with self._wlock:
+            self._out.write(json.dumps(obj) + "\n")
+            self._out.flush()
+
+    def notify(self, method, params=None):
+        self._write({"jsonrpc": "2.0", "method": method, "params": params or {}})
+
+    def request(self, method, params=None, timeout=600):
+        with self._id_lock:
+            self._id += 1
+            rid = self._id
+        q = queue.Queue()
+        self._pending[rid] = q
+        self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}})
+        try:
+            msg = q.get(timeout=timeout)
+        except queue.Empty:
+            return None, {"code": -32000, "message": "request timed out"}
+        finally:
+            self._pending.pop(rid, None)
+        return msg.get("result"), msg.get("error")
+
+    def _reply(self, rid, result=None, error=None):
+        msg = {"jsonrpc": "2.0", "id": rid}
+        if error is not None:
+            msg["error"] = error
+        else:
+            msg["result"] = {} if result is None else result
+        self._write(msg)
+
+    def handle_line(self, line):
+        line = (line or "").strip()
+        if not line:
+            return
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        # A response to one of our outbound requests (has id, no method).
+        if "method" not in msg and "id" in msg:
+            q = self._pending.get(msg.get("id"))
+            if q is not None:
+                q.put(msg)
+            return
+        method = msg.get("method")
+        rid = msg.get("id")
+        handler = self.handlers.get(method)
+        params = msg.get("params") or {}
+        if handler is None:
+            if rid is not None:
+                self._reply(rid, error={"code": -32601, "message": f"method not found: {method}"})
+            return
+        if rid is None:                      # notification — no reply
+            try:
+                handler(params)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        def run():
+            try:
+                self._reply(rid, result=handler(params))
+            except Exception as exc:  # noqa: BLE001
+                self._reply(rid, error={"code": -32000, "message": f"{type(exc).__name__}: {exc}"})
+
+        if self.async_requests:
+            threading.Thread(target=run, daemon=True).start()
+        else:
+            run()
+
+    def serve(self, infile):
+        for line in infile:
+            self.handle_line(line)
+
+
+# Per-run ACP state: the live peer, the active session, and the tool-call id
+# stack used to pair Hera's sequential tool_start/tool_end events into ACP
+# tool_call / tool_call_update notifications.
+_ACP = {"peer": None, "session_id": None, "tool_stack": [], "tc_seq": 0,
+        "stop_reason": "end_turn", "error": None}
+
+
+def _acp_tool_kind(name):
+    if name in _EDIT_TOOLS or name in ("apply_patch", "move_path", "delete_path", "notebook_edit"):
+        return "edit"
+    if name == "run_bash":
+        return "execute"
+    if name in ("web_search", "search", "glob", "semantic_search", "symbols"):
+        return "search"
+    if name in ("read_file", "list_dir", "view_image", "web_fetch"):
+        return "read"
+    return "other"
+
+
+def _acp_plan_entries(nodes):
+    entries = []
+    for n in nodes:
+        status = {"done": "completed", "running": "in_progress"}.get(n.get("status"), "pending")
+        content = n.get("title", "")
+        if n.get("status") in ("failed", "skipped"):
+            content = f"[{n['status']}] {content}"
+        entries.append({"content": content, "priority": "medium", "status": status})
+    return entries
+
+
+def _acp_emit(obj):
+    """Translate a Hera serve event into ACP session/update notifications (and
+    route approval_request to an outbound session/request_permission)."""
+    peer, sid = _ACP["peer"], _ACP["session_id"]
+    if peer is None or sid is None:
+        return
+
+    def upd(update):
+        peer.notify("session/update", {"sessionId": sid, "update": update})
+
+    t = obj.get("type")
+    if t == "token":
+        upd({"sessionUpdate": "agent_message_chunk",
+             "content": {"type": "text", "text": obj.get("delta", "")}})
+    elif t == "reasoning":
+        upd({"sessionUpdate": "agent_thought_chunk",
+             "content": {"type": "text", "text": obj.get("delta", "")}})
+    elif t == "tool_start":
+        _ACP["tc_seq"] += 1
+        tcid = f"tc_{_ACP['tc_seq']}"
+        _ACP["tool_stack"].append((obj.get("name"), tcid))
+        upd({"sessionUpdate": "tool_call", "toolCallId": tcid,
+             "title": obj.get("narration") or obj.get("name") or "tool",
+             "kind": _acp_tool_kind(obj.get("name", "")), "status": "in_progress"})
+    elif t == "tool_end":
+        _, tcid = (_ACP["tool_stack"].pop() if _ACP["tool_stack"]
+                   else (obj.get("name"), f"tc_{_ACP['tc_seq']}"))
+        content = [{"type": "content",
+                    "content": {"type": "text", "text": str(obj.get("output", ""))[:20000]}}]
+        diff = obj.get("diff")
+        if diff and diff.get("path"):
+            content.insert(0, {"type": "diff", "path": diff["path"],
+                               "oldText": diff.get("before") or None,
+                               "newText": diff.get("after") or ""})
+        upd({"sessionUpdate": "tool_call_update", "toolCallId": tcid,
+             "status": "failed" if obj.get("error") else "completed", "content": content})
+    elif t == "plan_graph":
+        upd({"sessionUpdate": "plan", "entries": _acp_plan_entries(obj.get("nodes", []))})
+    elif t == "todos":
+        entries = [{"content": i.get("content", ""), "priority": "medium",
+                    "status": {"completed": "completed", "in_progress": "in_progress"}
+                    .get(i.get("status"), "pending")} for i in obj.get("items", [])]
+        upd({"sessionUpdate": "plan", "entries": entries})
+    elif t == "approval_request":
+        _acp_request_permission(obj)
+    elif t == "turn_end":
+        _ACP["stop_reason"] = "cancelled" if obj.get("interrupted") else "end_turn"
+    elif t == "error":
+        _ACP["error"] = obj.get("message")
+        upd({"sessionUpdate": "agent_message_chunk",
+             "content": {"type": "text", "text": f"[error] {obj.get('message')}"}})
+    # info / suggestions / auto_mode / ready have no ACP equivalent → dropped.
+
+
+def _acp_permission_options():
+    return [{"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "allow_always", "name": "Always allow", "kind": "allow_always"},
+            {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]
+
+
+def _acp_request_permission(obj):
+    """Send an ACP session/request_permission for a tool call, then feed the
+    client's decision back onto _APPROVAL_Q so _serve_approve unblocks."""
+    peer, sid = _ACP["peer"], _ACP["session_id"]
+    name = obj.get("name", "tool")
+    tcid = _ACP["tool_stack"][-1][1] if _ACP["tool_stack"] else "tc_pending"
+    result, _err = peer.request("session/request_permission", {
+        "sessionId": sid,
+        "toolCall": {"toolCallId": tcid, "title": obj.get("preview") or name,
+                     "kind": _acp_tool_kind(name)},
+        "options": _acp_permission_options(),
+    })
+    decision = "n"
+    outcome = (result or {}).get("outcome") or {}
+    if outcome.get("outcome") == "selected":
+        decision = {"allow_once": "y", "allow_always": "a", "reject": "n"}.get(
+            outcome.get("optionId"), "n")
+    _APPROVAL_Q.put({"type": "approval", "decision": decision})
+
+
+def _acp_plan_approver(plan):
+    peer, sid = _ACP["peer"], _ACP["session_id"]
+    if not peer or not sid:
+        return "no", ""
+    result, _err = peer.request("session/request_permission", {
+        "sessionId": sid,
+        "toolCall": {"toolCallId": "plan", "title": "Review plan:\n" + (plan or ""), "kind": "other"},
+        "options": [{"optionId": "proceed", "name": "Proceed", "kind": "allow_once"},
+                    {"optionId": "auto", "name": "Proceed + auto-accept edits", "kind": "allow_always"},
+                    {"optionId": "keep", "name": "Keep planning", "kind": "reject_once"}],
+    })
+    outcome = (result or {}).get("outcome") or {}
+    if outcome.get("outcome") == "selected":
+        return {"proceed": "yes", "auto": "auto", "keep": "no"}.get(outcome.get("optionId"), "no"), ""
+    return "no", ""
+
+
+def _acp_install_approver(program, plan):
+    peer, sid = _ACP["peer"], _ACP["session_id"]
+    if not peer or not sid:
+        return False
+    result, _err = peer.request("session/request_permission", {
+        "sessionId": sid,
+        "toolCall": {"toolCallId": "install", "title": f"Install {program}: {plan}", "kind": "execute"},
+        "options": [{"optionId": "allow", "name": "Install", "kind": "allow_once"},
+                    {"optionId": "reject", "name": "Skip", "kind": "reject_once"}],
+    })
+    outcome = (result or {}).get("outcome") or {}
+    return outcome.get("outcome") == "selected" and outcome.get("optionId") == "allow"
+
+
+def _acp_prompt_to_text(blocks):
+    """Flatten an ACP prompt (list of ContentBlocks) into (text, images)."""
+    parts, images = [], []
+    for b in (blocks or []):
+        if not isinstance(b, dict):
+            continue
+        bt = b.get("type")
+        if bt == "text":
+            parts.append(b.get("text", ""))
+        elif bt == "image" and b.get("data"):
+            mime = b.get("mimeType", "image/png")
+            images.append((f"image-{len(images) + 1}", f"data:{mime};base64,{b['data']}"))
+        elif bt == "resource":
+            res = b.get("resource") or {}
+            if res.get("text"):
+                parts.append(res["text"])
+        elif bt == "resource_link" and b.get("uri"):
+            parts.append(b["uri"])
+    return "\n".join(p for p in parts if p), images
+
+
+def acp_main():
+    global _EMIT_SINK, _EDITOR_NATIVE_APPLY, _PLAN_APPROVER, _INSTALL_APPROVER
+    resolve_identity()
+    register_extensions(quiet=True)
+    peer = AcpPeer(sys.stdout)
+    _ACP["peer"] = peer
+    _EMIT_SINK = _acp_emit
+    _EDITOR_NATIVE_APPLY = False              # ACP writes go through the CLI tools
+    _PLAN_APPROVER = _acp_plan_approver
+    _INSTALL_APPROVER = _acp_install_approver
+    sessions = {}                            # sessionId -> messages
+
+    def on_initialize(params):
+        return {"protocolVersion": ACP_PROTOCOL_VERSION,
+                "agentCapabilities": {"loadSession": False,
+                                      "promptCapabilities": {"image": True, "embeddedContext": True}},
+                "authMethods": []}
+
+    def on_authenticate(_params):
+        return {}
+
+    def on_new(params):
+        sid = new_session_id()
+        sessions[sid] = [{"role": "system", "content": system_prompt()}]
+        return {"sessionId": sid}
+
+    def on_prompt(params):
+        sid = params.get("sessionId")
+        msgs = sessions.get(sid)
+        if msgs is None:
+            raise RuntimeError(f"unknown session: {sid}")
+        _ACP["session_id"] = sid
+        _ACP["stop_reason"], _ACP["error"], _ACP["tool_stack"] = "end_turn", None, []
+        CURRENT_SESSION["id"] = sid
+        _INTERRUPT.clear()
+        text, images = _acp_prompt_to_text(params.get("prompt"))
+        content, _attached = expand_mentions(text, extra_images=images)
+        msgs.append({"role": "user", "content": content})
+        try:
+            _serve_run(msgs)
+        finally:
+            save_session(msgs)
+        return {"stopReason": _ACP["stop_reason"]}
+
+    def on_cancel(_params):
+        _INTERRUPT.set()
+
+    peer.handlers.update({
+        "initialize": on_initialize,
+        "authenticate": on_authenticate,
+        "session/new": on_new,
+        "session/prompt": on_prompt,
+        "session/cancel": on_cancel,
+    })
+    try:
+        peer.serve(sys.stdin)
+    finally:
+        close_extensions()
+
+
 # ── REPL ──────────────────────────────────────────────────────────────────────
 def _start_new_session():
     CURRENT_SESSION["id"] = new_session_id()
@@ -7422,6 +7753,8 @@ def main():
                     help="list saved sessions and exit")
     ap.add_argument("--serve", action="store_true",
                     help="headless JSON mode over stdin/stdout (used by the VS Code extension)")
+    ap.add_argument("--acp", action="store_true",
+                    help="headless ACP (Agent Client Protocol) JSON-RPC 2.0 mode over stdio")
     ap.add_argument("--print", "-p", dest="print_prompt", nargs="?", const="", default=None,
                     metavar="PROMPT",
                     help="headless one-shot: run PROMPT (or stdin) and print the result, then exit")
@@ -7472,6 +7805,10 @@ def main():
 
     if args.serve:
         serve_main()
+        return
+
+    if args.acp:
+        acp_main()
         return
 
     if args.list_sessions:

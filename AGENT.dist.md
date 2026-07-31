@@ -14,7 +14,12 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.50`.
+- **Version:** `0.8.51`.
+- **ACP (Agent Client Protocol) mode.** `hera --acp` speaks newline-delimited JSON-RPC 2.0 over stdio
+  (Zed's Agent Client Protocol), so ACP editors/orchestrators can drive Hera. It reuses the same agent
+  engine as `--serve`; the bespoke `--serve` JSON protocol is unchanged. Handles `initialize`,
+  `session/new`, `session/prompt`, `session/cancel`; streams `agent_message_chunk`/`tool_call`/`plan`
+  updates and asks permission via `session/request_permission`.
 - **Task-graph plan mode.** `plan_graph` declares a DAG of subtasks (`{id, title, detail?, deps}`), and
   `run_plan_graph` executes it — independent branches run in parallel through the sub-agent pool while
   dependents wait and receive their prerequisites' results. Nodes whose prerequisite failed are skipped.

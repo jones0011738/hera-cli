@@ -14,7 +14,11 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.51`.
+- **Version:** `0.8.52`.
+- **Fullscreen TUI.** `hera --tui` opens a curses UI: scrollback + input + status bar + a live task-graph
+  sidebar (updates as `plan_graph`/`run_plan_graph` run). Wheel/PgUp-PgDn scroll, Ctrl-C interrupts,
+  Esc/Ctrl-D quits; approvals appear as modal prompts. No extra dependency; falls back to the plain
+  prompt on a non-interactive terminal or where curses is unavailable.
 - **ACP (Agent Client Protocol) mode.** `hera --acp` speaks newline-delimited JSON-RPC 2.0 over stdio
   (Zed's Agent Client Protocol), so ACP editors/orchestrators can drive Hera. It reuses the same agent
   engine as `--serve`; the bespoke `--serve` JSON protocol is unchanged. Handles `initialize`,

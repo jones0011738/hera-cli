@@ -156,7 +156,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.51"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.52"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -7537,6 +7537,433 @@ def acp_main():
         close_extensions()
 
 
+# ── Fullscreen TUI (curses) ──────────────────────────────────────────────────
+# Optional fullscreen front-end (--tui): scrollback pane, input line, status bar,
+# and a live task-graph sidebar. Built on the stdlib `curses` (no new dependency);
+# falls back to the line-based REPL when curses isn't available (Windows console,
+# non-TTY, TERM=dumb). Like --serve/--acp it reuses the agent engine (_serve_run)
+# by swapping the emit sink; the agent runs on a worker thread while the main
+# thread owns the screen (curses isn't thread-safe), events crossing via a queue.
+# All display state lives in the pure, unit-tested TuiModel; the curses layer is a
+# thin render/event loop on top.
+
+_TUI_Q = None          # worker → main: Hera serve events
+_TUI_PLAN_Q = None     # main → worker: plan-approval decision (decision, feedback)
+
+
+def _tui_available():
+    if os.environ.get("TERM", "") in ("", "dumb"):
+        return False
+    if not (sys.stdout.isatty() and sys.stdin.isatty()):
+        return False
+    try:
+        import curses  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def _tui_wrap(text, width):
+    """Word-wrap one logical line to `width`, preserving explicit newlines."""
+    if width <= 1:
+        return [str(text)]
+    out = []
+    for para in str(text).split("\n"):
+        if not para:
+            out.append("")
+            continue
+        while len(para) > width:
+            cut = para.rfind(" ", 0, width + 1)   # a space AT the boundary is a valid break
+            if cut <= 0:
+                cut = width
+            out.append(para[:cut])
+            para = para[cut:].lstrip(" ")
+        out.append(para)
+    return out
+
+
+def _tui_graph_lines(nodes):
+    """Plain (glyph, style, text) rows for the task-graph sidebar."""
+    done = sum(1 for n in nodes if n.get("status") == "done")
+    rows = [("", "graph_head", f"Task graph {done}/{len(nodes)}")]
+    for n in nodes:
+        glyph, _col = _PLAN_GLYPH.get(n.get("status"), (SYM_PENDING, ""))
+        rows.append((glyph, f"g_{n.get('status', 'pending')}",
+                     f"{n.get('id', '')} {n.get('title', '')}"))
+    return rows
+
+
+class TuiModel:
+    """Pure display state for the TUI (no curses): scrollback, input line, graph."""
+
+    def __init__(self):
+        self.lines = []            # scrollback: list of [style, text]
+        self.graph = []            # last plan_graph nodes
+        self.input = ""
+        self.cursor = 0
+        self.scroll = 0            # rows scrolled up from the bottom (0 = live tail)
+        self.status = "ready"
+        self.busy = False
+        self._stream_style = None
+
+    # -- input line editing --
+    def insert(self, s):
+        self.input = self.input[:self.cursor] + s + self.input[self.cursor:]
+        self.cursor += len(s)
+
+    def backspace(self):
+        if self.cursor > 0:
+            self.input = self.input[:self.cursor - 1] + self.input[self.cursor:]
+            self.cursor -= 1
+
+    def delete(self):
+        if self.cursor < len(self.input):
+            self.input = self.input[:self.cursor] + self.input[self.cursor + 1:]
+
+    def left(self):
+        self.cursor = max(0, self.cursor - 1)
+
+    def right(self):
+        self.cursor = min(len(self.input), self.cursor + 1)
+
+    def home(self):
+        self.cursor = 0
+
+    def end(self):
+        self.cursor = len(self.input)
+
+    def take_input(self):
+        s = self.input.strip()
+        self.input, self.cursor = "", 0
+        return s
+
+    # -- scrollback --
+    def add_line(self, text, style="normal"):
+        for part in str(text).split("\n"):
+            self.lines.append([style, part])
+        self._stream_style = None
+
+    def _stream(self, text, style):
+        if not text:
+            return
+        parts = text.split("\n")
+        if self._stream_style != style or not self.lines:
+            self.lines.append([style, ""])
+            self._stream_style = style
+        self.lines[-1][1] += parts[0]
+        for p in parts[1:]:
+            self.lines.append([style, p])
+
+    def ingest(self, obj):
+        """Fold one Hera serve event into display state. Returns 'approval' or
+        'plan_review' when the loop must open a modal, else None."""
+        t = obj.get("type")
+        if t == "token":
+            self._stream(obj.get("delta", ""), "assistant")
+        elif t == "reasoning":
+            self._stream(obj.get("delta", ""), "reasoning")
+        elif t == "tool_start":
+            self.add_line(f"{SYM_SUB} {obj.get('narration') or obj.get('name') or 'tool'}", "tool")
+            self.status = obj.get("name", "…")
+        elif t == "tool_end":
+            self.status = "ready"
+            if obj.get("error"):
+                self.add_line(f"  {str(obj.get('output', ''))[:200]}", "error")
+        elif t == "plan_graph":
+            self.graph = obj.get("nodes", [])
+        elif t == "info":
+            self.add_line(f"{SYM_BULLET} {obj.get('text', '')}", "info")
+        elif t == "error":
+            self.add_line(f"[error] {obj.get('message', '')}", "error")
+            self.status = "ready"
+        elif t == "turn_end":
+            self.status = "ready"
+            self._stream_style = None
+        elif t == "approval_request":
+            return "approval"
+        elif t == "plan_review":
+            return "plan_review"
+        return None
+
+
+def _tui_emit(obj):
+    if _TUI_Q is not None:
+        _TUI_Q.put(obj)
+
+
+def _tui_plan_approver(plan):
+    _tui_emit({"type": "plan_review", "plan": plan})
+    if _TUI_PLAN_Q is None:
+        return "no", ""
+    try:
+        return _TUI_PLAN_Q.get(timeout=1800)
+    except queue.Empty:
+        return "no", ""
+
+
+def _tui_install_approver(program, plan):
+    _tui_emit({"type": "approval_request", "name": "install_tool",
+               "preview": f"install {program} {SYM_EMDASH} {plan}"})
+    msg = _APPROVAL_Q.get()
+    return bool(msg) and msg.get("decision") in ("y", "a", "p")
+
+
+def _tui_addstr(win, y, x, text, attr=0):
+    try:
+        win.addstr(y, x, text, attr)
+    except Exception:  # noqa: BLE001 — writing the last cell / off-screen raises
+        pass
+
+
+def _tui_draw_modal(stdscr, modal):
+    import curses
+    h, w = stdscr.getmaxyx()
+    if modal["kind"] == "approval":
+        obj = modal["obj"]
+        title = f"Approve {obj.get('name', 'tool')}?"
+        body = (obj.get("preview") or obj.get("command") or "")[:400]
+        opts = "[y] allow    [a] always    [n] reject"
+    else:
+        title = "Review plan"
+        body = (modal.get("plan") or "")[:1200]
+        opts = "[1] proceed    [2] proceed + auto-accept    [3] keep planning"
+    lines = [title, ""] + _tui_wrap(body, min(w - 8, 74)) + ["", opts]
+    bw = min(w - 2, max(len(l) for l in lines) + 4)
+    bh = min(h - 2, len(lines) + 2)
+    by, bx = (h - bh) // 2, (w - bw) // 2
+    for i in range(bh):
+        _tui_addstr(stdscr, by + i, bx, " " * bw, curses.A_REVERSE)
+    for i, l in enumerate(lines[:bh - 2]):
+        _tui_addstr(stdscr, by + 1 + i, bx + 2, l[:bw - 4],
+                    curses.A_REVERSE | (curses.A_BOLD if i == 0 else 0))
+
+
+def _tui_handle_modal_key(modal, ch, model):
+    if modal["kind"] == "approval":
+        d = {ord('y'): "y", ord('Y'): "y", ord('a'): "a", ord('A'): "a",
+             ord('n'): "n", ord('N'): "n", 27: "n"}.get(ch)
+        if d is None:
+            return
+        _APPROVAL_Q.put({"type": "approval", "decision": d})
+        model.add_line(f"{SYM_BULLET} {modal['obj'].get('name', 'tool')}: "
+                       f"{'approved' if d in ('y', 'a') else 'rejected'}", "info")
+        modal["done"] = True
+    else:
+        dec = {ord('1'): "yes", ord('2'): "auto", ord('3'): "no", 27: "no"}.get(ch)
+        if dec is None:
+            return
+        if _TUI_PLAN_Q is not None:
+            _TUI_PLAN_Q.put((dec, ""))
+        model.add_line(f"{SYM_BULLET} plan: {dec}", "info")
+        modal["done"] = True
+
+
+def _tui_run(stdscr, messages):
+    import curses
+    global _EMIT_SINK, _EDITOR_NATIVE_APPLY, _PLAN_APPROVER, _INSTALL_APPROVER, _TUI_Q, _TUI_PLAN_Q
+    _TUI_Q, _TUI_PLAN_Q = queue.Queue(), queue.Queue()
+    _EMIT_SINK = _tui_emit
+    _EDITOR_NATIVE_APPLY = False
+    _PLAN_APPROVER = _tui_plan_approver
+    _INSTALL_APPROVER = _tui_install_approver
+
+    stdscr.nodelay(True)
+    stdscr.timeout(80)
+    try:
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    except Exception:  # noqa: BLE001
+        pass
+    pairs = {}
+    if curses.has_colors():
+        try:
+            curses.use_default_colors()
+        except Exception:  # noqa: BLE001
+            pass
+        for idx, color in ((1, curses.COLOR_CYAN), (2, curses.COLOR_GREEN),
+                           (3, curses.COLOR_RED), (4, curses.COLOR_YELLOW)):
+            try:
+                curses.init_pair(idx, color, -1)
+                pairs[color] = curses.color_pair(idx)
+            except Exception:  # noqa: BLE001
+                pairs[color] = 0
+    cyan = pairs.get(curses.COLOR_CYAN, 0)
+    STYLE = {
+        "normal": 0, "assistant": 0, "reasoning": curses.A_DIM,
+        "tool": cyan, "info": curses.A_DIM, "error": pairs.get(curses.COLOR_RED, 0),
+        "user": cyan | curses.A_BOLD, "graph_head": curses.A_BOLD,
+        "g_done": pairs.get(curses.COLOR_GREEN, 0), "g_running": cyan | curses.A_BOLD,
+        "g_failed": pairs.get(curses.COLOR_RED, 0), "g_skipped": curses.A_DIM,
+        "g_pending": curses.A_DIM,
+    }
+    model = TuiModel()
+    model.add_line(f"{NAME} {VERSION} — fullscreen TUI. Type a message, Enter to send. "
+                   f"PgUp/PgDn or wheel scrolls; Ctrl-C interrupts; Esc/Ctrl-D quits.", "info")
+    modal = None
+
+    def start_turn(text):
+        model.add_line(f"{SYM_PROMPT} {text}", "user")
+        content, _attached = expand_mentions(text)
+        messages.append({"role": "user", "content": content})
+        model.busy, model.status, model.scroll = True, "working", 0
+
+        def run():
+            try:
+                _serve_run(messages)
+            except Exception as exc:  # noqa: BLE001
+                _tui_emit({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+            _tui_emit({"type": "__done__"})
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def render():
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        show_graph = bool(model.graph) and w >= 60
+        gw = min(38, w // 3) if show_graph else 0
+        body_w = max(1, w - (gw + 1 if gw else 0))
+        body_h = max(1, h - 2)
+        status = (f" {NAME} {VERSION}  {SYM_MIDDOT} {MODEL}  {SYM_MIDDOT} "
+                  f"{SESSION.get('total', 0)} tok  {SYM_MIDDOT} auto:{AUTO_MODE}  "
+                  f"{SYM_MIDDOT} {model.status} ")
+        _tui_addstr(stdscr, 0, 0, status.ljust(w)[:w], curses.A_REVERSE)
+        rows = []
+        for style, text in model.lines:
+            for wl in _tui_wrap(text, body_w):
+                rows.append((style, wl))
+        top = max(0, len(rows) - body_h - model.scroll)
+        for i, (style, text) in enumerate(rows[top: top + body_h]):
+            _tui_addstr(stdscr, 1 + i, 0, text[:body_w], STYLE.get(style, 0))
+        if show_graph:
+            gx = body_w + 1
+            for i in range(1, h - 1):
+                _tui_addstr(stdscr, i, body_w, "│", curses.A_DIM)
+            gy = 1
+            for glyph, style, text in _tui_graph_lines(model.graph):
+                line = (f"{glyph} {text}" if glyph else text)[:gw - 1]
+                _tui_addstr(stdscr, gy, gx, line, STYLE.get(style, 0))
+                gy += 1
+                if gy >= h - 1:
+                    break
+        prompt = "> "
+        avail = max(1, w - len(prompt) - 1)
+        start = max(0, model.cursor - avail)
+        _tui_addstr(stdscr, h - 1, 0, prompt, curses.A_BOLD)
+        _tui_addstr(stdscr, h - 1, len(prompt), model.input[start:start + avail])
+        if modal:
+            _tui_draw_modal(stdscr, modal)
+            try:
+                curses.curs_set(0)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            try:
+                curses.curs_set(1)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                stdscr.move(h - 1, min(w - 1, len(prompt) + (model.cursor - start)))
+            except Exception:  # noqa: BLE001
+                pass
+        stdscr.refresh()
+
+    while True:
+        while True:
+            try:
+                obj = _TUI_Q.get_nowait()
+            except queue.Empty:
+                break
+            if obj.get("type") == "__done__":
+                model.busy, model.status = False, "ready"
+                save_session(messages)
+                continue
+            action = model.ingest(obj)
+            if action == "approval":
+                modal = {"kind": "approval", "obj": obj}
+            elif action == "plan_review":
+                modal = {"kind": "plan", "plan": obj.get("plan", "")}
+        render()
+        try:
+            ch = stdscr.getch()
+        except KeyboardInterrupt:
+            if model.busy:
+                _INTERRUPT.set()
+                model.status = "interrupting…"
+                continue
+            break
+        if ch == -1:
+            continue
+        if modal:
+            _tui_handle_modal_key(modal, ch, model)
+            if modal.get("done"):
+                modal = None
+            continue
+        if ch == curses.KEY_RESIZE:
+            continue
+        if ch == 4:                       # Ctrl-D
+            break
+        if ch in (3, 27):                 # Ctrl-C / Esc
+            if model.busy:
+                _INTERRUPT.set()
+                model.status = "interrupting…"
+                continue
+            break
+        if ch in (curses.KEY_ENTER, 10, 13):
+            if model.busy:
+                continue
+            text = model.take_input()
+            if not text:
+                continue
+            low = text.lower()
+            if low in ("/exit", "/quit"):
+                break
+            if low in ("/clear", "/new"):
+                messages[:] = _start_new_session()
+                model.lines, model.graph, model._stream_style = [], [], None
+                model.add_line("started a fresh session", "info")
+                continue
+            if low == "/undo":
+                model.add_line(undo_last(), "info")
+                continue
+            start_turn(text)
+            continue
+        if ch in (curses.KEY_BACKSPACE, 127, 8):
+            model.backspace()
+        elif ch == curses.KEY_DC:
+            model.delete()
+        elif ch == curses.KEY_LEFT:
+            model.left()
+        elif ch == curses.KEY_RIGHT:
+            model.right()
+        elif ch == curses.KEY_HOME:
+            model.home()
+        elif ch == curses.KEY_END:
+            model.end()
+        elif ch == curses.KEY_UP:
+            model.scroll += 1
+        elif ch == curses.KEY_DOWN:
+            model.scroll = max(0, model.scroll - 1)
+        elif ch == curses.KEY_PPAGE:
+            model.scroll += 10
+        elif ch == curses.KEY_NPAGE:
+            model.scroll = max(0, model.scroll - 10)
+        elif ch == curses.KEY_MOUSE:
+            try:
+                _bid, _mx, _my, _mz, bstate = curses.getmouse()
+                if bstate & getattr(curses, "BUTTON4_PRESSED", 0):
+                    model.scroll += 3
+                elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
+                    model.scroll = max(0, model.scroll - 3)
+            except Exception:  # noqa: BLE001
+                pass
+        elif 32 <= ch < 127:
+            model.insert(chr(ch))
+
+
+def tui_main(messages):
+    import curses
+    curses.wrapper(_tui_run, messages)
+
+
 # ── REPL ──────────────────────────────────────────────────────────────────────
 def _start_new_session():
     CURRENT_SESSION["id"] = new_session_id()
@@ -7755,6 +8182,8 @@ def main():
                     help="headless JSON mode over stdin/stdout (used by the VS Code extension)")
     ap.add_argument("--acp", action="store_true",
                     help="headless ACP (Agent Client Protocol) JSON-RPC 2.0 mode over stdio")
+    ap.add_argument("--tui", action="store_true",
+                    help="fullscreen terminal UI (curses) with a live task-graph panel")
     ap.add_argument("--print", "-p", dest="print_prompt", nargs="?", const="", default=None,
                     metavar="PROMPT",
                     help="headless one-shot: run PROMPT (or stdin) and print the result, then exit")
@@ -7851,7 +8280,12 @@ def main():
     if messages is None:
         messages = _start_new_session()
 
-    print_banner()
+    use_tui = args.tui and _tui_available()
+    if args.tui and not use_tui:
+        print(f"{YELL}[tui] not available here (needs an interactive UTF-8 terminal with curses) "
+              f"{SYM_EMDASH} using the plain prompt.{R}", file=sys.stderr)
+    if not use_tui:
+        print_banner()
     spinner = Spinner()
 
     # SessionStart hooks may print a status line and inject startup context.
@@ -7862,7 +8296,15 @@ def main():
     _emit_metric("hera.sessions", 1)
 
     try:
-        _repl(messages, spinner)
+        if use_tui:
+            try:
+                tui_main(messages)
+            except Exception as exc:  # noqa: BLE001 — restore terminal, fall back to the REPL
+                print(f"{YELL}[tui] {type(exc).__name__}: {exc} {SYM_EMDASH} falling back to the "
+                      f"plain prompt.{R}", file=sys.stderr)
+                _repl(messages, spinner)
+        else:
+            _repl(messages, spinner)
     finally:
         _run_hooks("SessionEnd")
         _emit_telemetry("session_end", total_tokens=SESSION.get("total", 0),

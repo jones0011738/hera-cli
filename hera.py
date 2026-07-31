@@ -156,7 +156,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.47"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.49"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -188,6 +188,10 @@ IMAGE_EXTS   = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 YOLO    = _truthy(_env("HERA_YOLO", "QWEN_YOLO"))
 MAX_STEPS      = int(_env("HERA_MAX_STEPS", "QWEN_MAX_STEPS", default="0"))  # 0 = unlimited
 HIDE_REASONING = _truthy(_env("HERA_HIDE_REASONING", "QWEN_HIDE_REASONING"))
+# Bounded parallel sub-agent pool (Grok-Build-style fan-out). When the model
+# delegates several independent subtasks at once, at most this many run
+# concurrently; the rest queue and start as slots free up. 0/blank → default 8.
+SUBAGENT_MAX_PARALLEL = int(_env("HERA_SUBAGENT_POOL", default="8") or 8) or 8
 
 # Output style (Claude-Code-style): shapes how answers are written. Built-ins
 # below; custom styles live in ~/.config/hera/output-styles/<name>.md.
@@ -242,6 +246,13 @@ SESSION = {"prompt": 0, "completion": 0, "total": 0, "requests": 0}
 # The server-reported total tokens of the last request — used as ground truth for
 # auto-compaction (more accurate than estimating from characters).
 _LAST_PROMPT_TOKENS = 0
+# Parallel sub-agents fold their usage into SESSION and push edit checkpoints
+# from worker threads, so those shared mutations are serialized behind locks.
+_ACCOUNT_LOCK = threading.Lock()
+_CHECKPOINT_LOCK = threading.RLock()
+# The active parent conversation for the current turn, so `task` can hand a
+# focused slice of context down to a sub-agent (Grok-Build-style inheritance).
+_ACTIVE_MESSAGES = None
 
 # ── Claude-parity feature config ──────────────────────────────────────────────
 # Cost estimate: USD price per 1M tokens. 0 (the default) hides the $ display.
@@ -3222,13 +3233,16 @@ def _account(usage):
     p = usage.get("prompt_tokens", 0)
     c = usage.get("completion_tokens", 0)
     t = usage.get("total_tokens", p + c)
-    # Remember the server's real prompt size so auto-compaction triggers on
-    # ground truth rather than a rough char estimate.
-    _LAST_PROMPT_TOKENS = p + c
-    SESSION["prompt"]     += p
-    SESSION["completion"] += c
-    SESSION["total"]      += t
-    SESSION["requests"]   += 1
+    # Parallel sub-agents call this from worker threads; serialize the shared
+    # counter updates so concurrent turns don't lose increments.
+    with _ACCOUNT_LOCK:
+        # Remember the server's real prompt size so auto-compaction triggers on
+        # ground truth rather than a rough char estimate.
+        _LAST_PROMPT_TOKENS = p + c
+        SESSION["prompt"]     += p
+        SESSION["completion"] += c
+        SESSION["total"]      += t
+        SESSION["requests"]   += 1
     _emit_telemetry("request", prompt_tokens=p, completion_tokens=c, total_tokens=t)
     _emit_metric("hera.tokens", t, kind="total")
     _emit_metric("hera.requests", 1)
@@ -3252,17 +3266,19 @@ def _snapshot(path):
 
 
 def push_checkpoint(path, snap, label):
-    CHECKPOINTS.append({
-        "kind": "file_restore",
-        "path": _resolve(path),
-        "existed": snap[0],
-        "content": snap[1],
-        "label": label,
-    })
+    with _CHECKPOINT_LOCK:  # sub-agents push checkpoints from worker threads
+        CHECKPOINTS.append({
+            "kind": "file_restore",
+            "path": _resolve(path),
+            "existed": snap[0],
+            "content": snap[1],
+            "label": label,
+        })
 
 
 def push_transaction(ops, label):
-    CHECKPOINTS.append({"kind": "transaction", "ops": list(ops), "label": label})
+    with _CHECKPOINT_LOCK:
+        CHECKPOINTS.append({"kind": "transaction", "ops": list(ops), "label": label})
 
 
 def _rm_path(path):
@@ -3437,6 +3453,7 @@ def context_report(messages):
 # ── Agent loop ────────────────────────────────────────────────────────────────
 def run_agent(messages, spinner):
     """Drive the reason→act loop until the model produces a final answer."""
+    globals()["_ACTIVE_MESSAGES"] = messages  # let `task` inherit parent context
     turn_tokens = 0
     did_work = False       # did this turn actually use tools? (gates next-step tips)
     edited_code = False    # wrote/edited a code file
@@ -3736,7 +3753,26 @@ def _agent_model(agent):
     return None
 
 
-def run_subagent(description, agent=None, model=None, quiet=False):
+def _inherit_slice(max_chars=1500):
+    """A compact slice of the parent conversation to hand a sub-agent so it
+    isn't blind to the overall goal. Returns "" when there's nothing useful."""
+    msgs = _ACTIVE_MESSAGES or []
+    goal = next((_text_of(m.get("content")) for m in reversed(msgs)
+                 if m.get("role") == "user"), "").strip()
+    last_asst = next((_text_of(m.get("content")) for m in reversed(msgs)
+                      if m.get("role") == "assistant" and _text_of(m.get("content")).strip()), "").strip()
+    parts = []
+    if goal:
+        parts.append(f"Overall user goal: {goal}")
+    if last_asst:
+        parts.append(f"Most recent progress: {last_asst}")
+    out = "\n".join(parts).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars].rstrip() + f"{SYM_ELLIPSIS}"
+    return out
+
+
+def run_subagent(description, agent=None, model=None, quiet=False, inherit=None):
     """Run a focused nested agent on `description`; return its final answer text.
 
     The sub-agent has every tool except `task` itself (so it can't recurse),
@@ -3748,6 +3784,8 @@ def run_subagent(description, agent=None, model=None, quiet=False):
 
     `quiet=True` runs it on the calling worker thread without live output (used
     by parallel delegation) — its result is still returned to the parent.
+    `inherit` is an optional context slice from the parent conversation, injected
+    so the sub-agent understands the broader goal it's contributing to.
     """
     if quiet:
         _QUIET.on = True
@@ -3767,6 +3805,9 @@ def run_subagent(description, agent=None, model=None, quiet=False):
                        if t.strip()]
             if allowed:
                 sub_schemas = [s for s in sub_schemas if s["function"]["name"] in allowed]
+        if inherit:
+            sys_prompt += ("\n\nContext inherited from the parent task (for orientation only — "
+                           "still do exactly the delegated subtask):\n" + inherit)
         msgs = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": description},
@@ -3811,20 +3852,31 @@ def run_subagent(description, agent=None, model=None, quiet=False):
 
 
 def run_subagents_parallel(specs):
-    """Run several sub-agents concurrently (each quiet, on its own thread) and
-    return their combined results. `specs` is a list of {description, agent?, model?}."""
+    """Run several sub-agents through a bounded pool (each quiet, on its own
+    thread) and return their combined results, in the order given. `specs` is a
+    list of {description, agent?, model?, inherit?}.
+
+    At most SUBAGENT_MAX_PARALLEL run at once; extra specs queue on a semaphore
+    and start as slots free up — a worker is spawned per spec but blocks on the
+    gate until a slot is available, so results stay index-aligned with `specs`."""
     results = [None] * len(specs)
+    cap = max(1, SUBAGENT_MAX_PARALLEL)
+    gate = threading.Semaphore(cap)
 
     def worker(i, spec):
-        results[i] = run_subagent(spec.get("description", ""), agent=spec.get("agent"),
-                                  model=spec.get("model"), quiet=True)
+        with gate:
+            kwargs = {"agent": spec.get("agent"), "model": spec.get("model"), "quiet": True}
+            if spec.get("inherit"):
+                kwargs["inherit"] = spec["inherit"]
+            results[i] = run_subagent(spec.get("description", ""), **kwargs)
 
     threads = []
     for i, spec in enumerate(specs):
         t = threading.Thread(target=worker, args=(i, spec), daemon=True)
         t.start()
         threads.append(t)
-    print(f"\n  {BLUE}{SYM_SUB} running {len(specs)} sub-agents in parallel{SYM_ELLIPSIS}{R}")
+    waves = f" ({SUBAGENT_MAX_PARALLEL} at a time)" if len(specs) > cap else ""
+    print(f"\n  {BLUE}{SYM_SUB} running {len(specs)} sub-agents in parallel{waves}{SYM_ELLIPSIS}{R}")
     for t in threads:
         t.join()
     print(f"  {BLUE}{SYM_SUB} {len(specs)} sub-agents done{R}")
@@ -3833,11 +3885,18 @@ def run_subagents_parallel(specs):
                        + f"\n{results[i]}" for i in range(len(specs)))
 
 
-def tool_task(description=None, agent=None, model=None, tasks=None, **_ignored):
+def tool_task(description=None, agent=None, model=None, tasks=None,
+              inherit_context=False, **_ignored):
     # `tasks` (a list) runs several sub-agents in parallel; otherwise a single one.
+    # `inherit_context` hands each sub-agent a slice of the parent conversation.
+    inh = _inherit_slice() if inherit_context else ""
     if isinstance(tasks, list) and tasks:
+        if inh:
+            for spec in tasks:
+                if isinstance(spec, dict):
+                    spec.setdefault("inherit", inh)
         return run_subagents_parallel(tasks)
-    return run_subagent(description or "", agent=agent, model=model)
+    return run_subagent(description or "", agent=agent, model=model, inherit=inh or None)
 
 
 TOOLS["task"] = tool_task
@@ -3854,11 +3913,16 @@ TOOL_SCHEMAS.append({"type": "function", "function": {
         "model": {"type": "string", "description": "Optional model id to run this sub-agent on"},
         "tasks": {"type": "array", "description": ("Optional: run several sub-agents IN PARALLEL. "
                   "Each item is an object with description (and optional agent/model). Use this "
-                  "for independent subtasks you want done concurrently."),
+                  "for independent subtasks you want done concurrently — they run through a bounded "
+                  "pool, so you can queue many and they execute a few at a time."),
                   "items": {"type": "object", "properties": {
                       "description": {"type": "string"},
                       "agent": {"type": "string"},
                       "model": {"type": "string"}}, "required": ["description"]}},
+        "inherit_context": {"type": "boolean", "description": ("Set true to pass each sub-agent a "
+                            "short slice of the current conversation (the overall goal and latest "
+                            "progress) so it understands the bigger picture. Default false — omit "
+                            "for self-contained subtasks.")},
     }},
 }})
 
@@ -6672,8 +6736,11 @@ def _serve_exec(c):
         out = f"[denied] {verdict}"
         _emit({"type": "tool_end", "name": name, "error": True, "output": out})
         return out
-    if proposed_changes and name in ("write_file", "edit_file", "multi_edit", "apply_patch",
-                                     "notebook_edit", "move_path", "delete_path"):
+    # Editor-native apply needs a live editor host answering editor_apply_result;
+    # headless -p has none, so it must write via CLI tools or it deadlocks.
+    if proposed_changes and not _NONINTERACTIVE and \
+            name in ("write_file", "edit_file", "multi_edit", "apply_patch",
+                     "notebook_edit", "move_path", "delete_path"):
         ok, err = _serve_editor_apply(proposed_changes)
         if ok:
             push_transaction(_checkpoints_for_changes(proposed_changes, name), name)
@@ -6720,6 +6787,7 @@ def _serve_exec(c):
 
 
 def _serve_run(messages):
+    globals()["_ACTIVE_MESSAGES"] = messages  # let `task` inherit parent context
     turn = 0
     did_work = False
     edited_code = ran_command = verified = False

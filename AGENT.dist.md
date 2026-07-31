@@ -14,7 +14,11 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.47`.
+- **Version:** `0.8.49`.
+- **Parallel sub-agents run through a bounded pool.** When the model delegates several independent
+  subtasks with `task(tasks=[…])`, at most `HERA_SUBAGENT_POOL` (default 8) run concurrently; the rest
+  queue and start as slots free. Add `inherit_context: true` to pass each sub-agent a short slice of the
+  current conversation (overall goal + latest progress) so it understands the bigger picture.
 - **Model is a reasoning model** — `qwen3.6-35b-a3b` returns `reasoning_content` (thinking) separately
   from `content` (final answer), thinking first. With a small `max_tokens` the budget can be spent on
   reasoning before any `content` is produced, so `content` comes back empty with `finish_reason=length`

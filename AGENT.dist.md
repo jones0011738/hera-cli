@@ -14,7 +14,11 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.49`.
+- **Version:** `0.8.50`.
+- **Task-graph plan mode.** `plan_graph` declares a DAG of subtasks (`{id, title, detail?, deps}`), and
+  `run_plan_graph` executes it — independent branches run in parallel through the sub-agent pool while
+  dependents wait and receive their prerequisites' results. Nodes whose prerequisite failed are skipped.
+  Use it for larger jobs with a mix of independent and dependent steps; use `todo_write` for a linear list.
 - **Parallel sub-agents run through a bounded pool.** When the model delegates several independent
   subtasks with `task(tasks=[…])`, at most `HERA_SUBAGENT_POOL` (default 8) run concurrently; the rest
   queue and start as slots free. Add `inherit_context: true` to pass each sub-agent a short slice of the

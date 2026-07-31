@@ -156,7 +156,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.49"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.50"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -634,6 +634,13 @@ _EDIT_NUDGE = (
 
 # In-task to-do list (Claude-Code-style). Items: {"content": str, "status": ...}.
 TODOS = []
+
+# Task graph (Grok-Build-style plan mode). A DAG of subtasks the model declares
+# via the `plan_graph` tool and executes via `run_plan_graph`, which fans out the
+# ready nodes (deps satisfied) across independent branches through the bounded
+# sub-agent pool. Each node: {id, title, detail, deps:[ids], status, result}.
+# status ∈ pending | running | done | failed | skipped.
+PLAN_GRAPH = []
 
 # Background run_bash jobs: id -> {"proc", "out_path", "command", "started"}.
 _BG_JOBS = {}
@@ -3790,7 +3797,8 @@ def run_subagent(description, agent=None, model=None, quiet=False, inherit=None)
     if quiet:
         _QUIET.on = True
     try:
-        sub_schemas = [s for s in TOOL_SCHEMAS if s["function"]["name"] != "task"]
+        sub_schemas = [s for s in TOOL_SCHEMAS
+                       if s["function"]["name"] not in ("task", "plan_graph", "run_plan_graph")]
         sys_prompt = (f"You are a focused sub-agent of {NAME}. Complete the delegated task using "
                       f"your tools in {os.getcwd()}, then reply with a concise summary of what you "
                       f"found or changed. Be thorough but terse.")
@@ -3851,14 +3859,11 @@ def run_subagent(description, agent=None, model=None, quiet=False, inherit=None)
             _QUIET.on = False
 
 
-def run_subagents_parallel(specs):
-    """Run several sub-agents through a bounded pool (each quiet, on its own
-    thread) and return their combined results, in the order given. `specs` is a
-    list of {description, agent?, model?, inherit?}.
-
-    At most SUBAGENT_MAX_PARALLEL run at once; extra specs queue on a semaphore
-    and start as slots free up — a worker is spawned per spec but blocks on the
-    gate until a slot is available, so results stay index-aligned with `specs`."""
+def _run_subagent_wave(specs):
+    """Run `specs` concurrently through the bounded pool and return their results
+    as a list index-aligned with `specs`. A worker is spawned per spec but blocks
+    on a SUBAGENT_MAX_PARALLEL semaphore, so at most that many run at once while
+    ordering is preserved. Shared by `run_subagents_parallel` and the task graph."""
     results = [None] * len(specs)
     cap = max(1, SUBAGENT_MAX_PARALLEL)
     gate = threading.Semaphore(cap)
@@ -3875,10 +3880,19 @@ def run_subagents_parallel(specs):
         t = threading.Thread(target=worker, args=(i, spec), daemon=True)
         t.start()
         threads.append(t)
-    waves = f" ({SUBAGENT_MAX_PARALLEL} at a time)" if len(specs) > cap else ""
-    print(f"\n  {BLUE}{SYM_SUB} running {len(specs)} sub-agents in parallel{waves}{SYM_ELLIPSIS}{R}")
     for t in threads:
         t.join()
+    return results
+
+
+def run_subagents_parallel(specs):
+    """Run several sub-agents through the bounded pool and return their combined
+    results, in the order given. `specs` is a list of {description, agent?, model?,
+    inherit?}. At most SUBAGENT_MAX_PARALLEL run at once; the rest queue."""
+    cap = max(1, SUBAGENT_MAX_PARALLEL)
+    waves = f" ({SUBAGENT_MAX_PARALLEL} at a time)" if len(specs) > cap else ""
+    print(f"\n  {BLUE}{SYM_SUB} running {len(specs)} sub-agents in parallel{waves}{SYM_ELLIPSIS}{R}")
+    results = _run_subagent_wave(specs)
     print(f"  {BLUE}{SYM_SUB} {len(specs)} sub-agents done{R}")
     return "\n\n".join(f"### sub-agent {i + 1}"
                        + (f" ({specs[i].get('agent')})" if specs[i].get('agent') else "")
@@ -4101,6 +4115,194 @@ TOOL_SCHEMAS.append({"type": "function", "function": {
         "plan": {"type": "string", "description": "The plan to execute, as concise markdown "
                  "(numbered steps). Shown to the user for approval."},
     }, "required": ["plan"]},
+}})
+
+
+# ----- task graph: DAG plan mode with parallel branch execution (Grok-style) --
+_PLAN_GLYPH = {
+    "pending": (SYM_PENDING, GREY),
+    "running": (SYM_INPROG, ACCENT),
+    "done":    (SYM_DONE, GREEN),
+    "failed":  (SYM_CROSS, RED),
+    "skipped": (SYM_MIDDOT, GREY),
+}
+
+
+def _plan_graph_has_cycle(nodes):
+    """Kahn's algorithm: True if the dependency edges don't form a DAG."""
+    dependents = {n["id"]: [] for n in nodes}
+    indeg = {n["id"]: 0 for n in nodes}
+    for n in nodes:
+        for d in n["deps"]:
+            dependents[d].append(n["id"])
+            indeg[n["id"]] += 1
+    q = [nid for nid, deg in indeg.items() if deg == 0]
+    seen = 0
+    while q:
+        cur = q.pop()
+        seen += 1
+        for m in dependents[cur]:
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                q.append(m)
+    return seen != len(nodes)
+
+
+def _render_plan_graph_text():
+    if not PLAN_GRAPH:
+        return "no task graph declared"
+    done = sum(1 for n in PLAN_GRAPH if n["status"] == "done")
+    lines = [f"{BOLD}task graph{R} {DIM}({done}/{len(PLAN_GRAPH)} done){R}"]
+    for n in PLAN_GRAPH:
+        glyph, col = _PLAN_GLYPH.get(n["status"], (SYM_PENDING, GREY))
+        title = n["title"]
+        if n["status"] in ("done", "skipped"):
+            title = f"{GREY}{title}{R}"
+        elif n["status"] == "running":
+            title = f"{BOLD}{title}{R}"
+        dep = f" {DIM}(after {', '.join(n['deps'])}){R}" if n.get("deps") else ""
+        lines.append(f"  {col}{glyph}{R} {DIM}{n['id']}{R} {title}{dep}"
+                     f"  {DIM}{SYM_MIDDOT} {n['status']}{R}")
+    return "\n".join(lines)
+
+
+def tool_plan_graph(nodes=None, **_ignored):
+    """Declare/replace the task graph. Validates ids, dep references and acyclicity."""
+    global PLAN_GRAPH
+    if not isinstance(nodes, list) or not nodes:
+        return "[error] plan_graph needs a non-empty `nodes` list"
+    clean, ids = [], set()
+    for raw in nodes:
+        if not isinstance(raw, dict):
+            return "[error] each node must be an object with id and title"
+        nid = str(raw.get("id", "")).strip()
+        title = str(raw.get("title", "")).strip()
+        if not nid or not title:
+            return "[error] every node needs a non-empty `id` and `title`"
+        if nid in ids:
+            return f"[error] duplicate node id: {nid!r}"
+        ids.add(nid)
+        deps = [str(d).strip() for d in (raw.get("deps") or []) if str(d).strip()]
+        clean.append({"id": nid, "title": title, "detail": str(raw.get("detail", "")).strip(),
+                      "deps": deps, "status": "pending", "result": None})
+    for n in clean:
+        for d in n["deps"]:
+            if d not in ids:
+                return f"[error] node {n['id']!r} depends on unknown node {d!r}"
+        if n["id"] in n["deps"]:
+            return f"[error] node {n['id']!r} depends on itself"
+    if _plan_graph_has_cycle(clean):
+        return "[error] task graph has a cycle — dependencies must form a DAG"
+    PLAN_GRAPH = clean
+    return (_render_plan_graph_text()
+            + f"\n\n{len(clean)} node(s) declared. Call run_plan_graph to execute.")
+
+
+def _node_task_text(n):
+    return f"{n['title']}\n\n{n['detail']}".strip() if n.get("detail") else n["title"]
+
+
+def _node_inherit(n, by_id, base):
+    """Context handed to a node's sub-agent: the overall goal plus the results of
+    its already-completed prerequisites."""
+    parts = [base] if base else []
+    dep_results = [f"- {by_id[d]['title']}: {by_id[d]['result']}"
+                   for d in n["deps"] if by_id.get(d) and by_id[d].get("result")]
+    if dep_results:
+        parts.append("Results from prerequisite steps:\n" + "\n".join(dep_results))
+    out = "\n\n".join(parts).strip()
+    if len(out) > 2000:
+        out = out[:2000].rstrip() + SYM_ELLIPSIS
+    return out or None
+
+
+def run_plan_graph(inherit_context=True, **_ignored):
+    """Execute the declared task graph: repeatedly dispatch every node whose deps
+    are done as a parallel wave through the bounded sub-agent pool, propagating
+    prerequisite results forward and skipping nodes whose prerequisites failed.
+    Returns a combined per-node report for the parent to synthesize."""
+    if not PLAN_GRAPH:
+        return "[error] no task graph — call plan_graph first to declare nodes"
+    by_id = {n["id"]: n for n in PLAN_GRAPH}
+    for n in PLAN_GRAPH:
+        n["status"], n["result"] = "pending", None
+    base = _inherit_slice() if inherit_context else ""
+    wave = 0
+    while True:
+        # A pending node whose any dep failed/was-skipped can never run → skip it
+        # (iterate to a fixpoint so the skip cascades down the branch).
+        while True:
+            newly = [n for n in PLAN_GRAPH if n["status"] == "pending"
+                     and any(by_id[d]["status"] in ("failed", "skipped") for d in n["deps"])]
+            if not newly:
+                break
+            for n in newly:
+                n["status"] = "skipped"
+        ready = [n for n in PLAN_GRAPH if n["status"] == "pending"
+                 and all(by_id[d]["status"] == "done" for d in n["deps"])]
+        if not ready:
+            break
+        wave += 1
+        specs = []
+        for n in ready:
+            n["status"] = "running"
+            specs.append({"description": _node_task_text(n),
+                          "inherit": _node_inherit(n, by_id, base)})
+        print(f"\n  {BLUE}{SYM_SUB} task graph wave {wave}: {len(ready)} node(s) in parallel "
+              f"[{', '.join(n['id'] for n in ready)}]{SYM_ELLIPSIS}{R}")
+        results = _run_subagent_wave(specs)
+        for n, r in zip(ready, results):
+            n["result"] = r
+            n["status"] = "failed" if str(r or "").startswith("[sub-agent error]") else "done"
+    ok = [n for n in PLAN_GRAPH if n["status"] == "done"]
+    failed = [n for n in PLAN_GRAPH if n["status"] == "failed"]
+    skipped = [n for n in PLAN_GRAPH if n["status"] == "skipped"]
+    print(f"  {BLUE}{SYM_SUB} task graph done: {len(ok)} ok"
+          + (f", {len(failed)} failed" if failed else "")
+          + (f", {len(skipped)} skipped" if skipped else "") + f"{R}")
+    report = [_render_plan_graph_text(), ""]
+    for n in PLAN_GRAPH:
+        if n["result"]:
+            report.append(f"### [{n['id']}] {n['title']} ({n['status']})\n{n['result']}")
+        elif n["status"] == "skipped":
+            report.append(f"### [{n['id']}] {n['title']} (skipped — a prerequisite failed)")
+    return "\n\n".join(report).strip()
+
+
+def tool_run_plan_graph(inherit_context=True, **_ignored):
+    return run_plan_graph(inherit_context=inherit_context)
+
+
+TOOLS["plan_graph"] = tool_plan_graph
+TOOLS["run_plan_graph"] = tool_run_plan_graph
+TOOL_SCHEMAS.append({"type": "function", "function": {
+    "name": "plan_graph",
+    "description": ("Declare a task graph (a DAG of subtasks with dependencies) for a larger job whose "
+                    "parts can run in parallel. Each node has a short unique id, a title, optional detail, "
+                    "and deps (ids that must finish first). Independent nodes run concurrently; dependent "
+                    "ones wait and receive their prerequisites' results. After declaring, call "
+                    "run_plan_graph to execute. For a simple linear checklist, use todo_write instead."),
+    "parameters": {"type": "object", "properties": {
+        "nodes": {"type": "array", "description": "The DAG nodes (replaces any previous graph).",
+                  "items": {"type": "object", "properties": {
+                      "id": {"type": "string", "description": "Short unique id, e.g. '1' or 'analyze'"},
+                      "title": {"type": "string", "description": "Short imperative summary of the subtask"},
+                      "detail": {"type": "string", "description": "Optional fuller instructions for the sub-agent"},
+                      "deps": {"type": "array", "items": {"type": "string"},
+                               "description": "ids of nodes that must complete before this one"}},
+                      "required": ["id", "title"]}},
+    }, "required": ["nodes"]},
+}})
+TOOL_SCHEMAS.append({"type": "function", "function": {
+    "name": "run_plan_graph",
+    "description": ("Execute the task graph declared with plan_graph. Runs each node as a focused "
+                    "sub-agent, fanning out independent nodes in parallel (bounded pool) while respecting "
+                    "dependencies — a node starts only once its deps are done and receives their results. "
+                    "Returns every node's result to synthesize; nodes whose prerequisite failed are skipped."),
+    "parameters": {"type": "object", "properties": {
+        "inherit_context": {"type": "boolean", "description": ("Pass the overall goal and each node's "
+                            "prerequisite results down to its sub-agent (default true).")},
+    }},
 }})
 
 
@@ -6780,6 +6982,11 @@ def _serve_exec(c):
     # Push the refreshed checklist to the editor after a to-do update.
     if name == "todo_write" and not is_err:
         _emit({"type": "todos", "items": list(TODOS)})
+    # Push the task graph's shape/state to the editor after declaring or running it.
+    if name in ("plan_graph", "run_plan_graph") and not is_err:
+        _emit({"type": "plan_graph", "nodes": [
+            {"id": n["id"], "title": n["title"], "deps": n["deps"], "status": n["status"]}
+            for n in PLAN_GRAPH]})
     _run_hooks("PostToolUse", name, args, out)
     if MAX_TOOL_OUTPUT and len(out) > MAX_TOOL_OUTPUT:
         out = out[:MAX_TOOL_OUTPUT] + f"\n{SYM_ELLIPSIS}[truncated, {len(out)} chars total]"

@@ -156,7 +156,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.54"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.55"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -185,6 +185,12 @@ VISION_URL   = (_EXPLICIT_VISION_URL or API_URL).rstrip("/")
 VISION_MODEL = _cfg("HERA_VISION_MODEL", key="vision_model", default="").strip()
 VISION_AUTO  = not bool(_EXPLICIT_VISION_URL) and bool(VISION_URL)
 IMAGE_EXTS   = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+# Image generation (Stable Diffusion via the OpenAI-compatible /images route).
+# Defaults to the same base as chat (the auth-proxy, which routes it to
+# sd-server); override with HERA_IMAGE_URL if the image server lives elsewhere.
+_EXPLICIT_IMAGE_URL = _cfg("HERA_IMAGE_URL", key="image_url", default="").rstrip("/")
+IMAGE_GEN_URL   = (_EXPLICIT_IMAGE_URL or API_URL).rstrip("/")
+IMAGE_GEN_MODEL = _cfg("HERA_IMAGE_MODEL", key="image_model", default="sd-cpp-local").strip()
 YOLO    = _truthy(_env("HERA_YOLO", "QWEN_YOLO"))
 MAX_STEPS      = int(_env("HERA_MAX_STEPS", "QWEN_MAX_STEPS", default="0"))  # 0 = unlimited
 HIDE_REASONING = _truthy(_env("HERA_HIDE_REASONING", "QWEN_HIDE_REASONING"))
@@ -2171,6 +2177,92 @@ def tool_web_fetch(url, max_chars=9000):
     return f"{url}\n\n{text}"
 
 
+def _parse_size(size):
+    """'1024x1024' → (1024, 1024); tolerant of 'X'/spaces. Returns None on junk."""
+    if not size:
+        return None
+    m = re.match(r"\s*(\d{2,5})\s*[xX*]\s*(\d{2,5})\s*$", str(size))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def tool_generate_image(prompt, path=None, size="1024x1024", steps=None,
+                        cfg_scale=None, negative_prompt=None, seed=None):
+    """Generate an image from a text prompt via Stable Diffusion (sd-server) and
+    save it to disk. Returns the saved path. Uses the OpenAI-compatible
+    /v1/images/generations endpoint (b64_json); sd-server-native controls
+    (steps, cfg, negative prompt, seed) ride along via `sd_cpp_extra_args`."""
+    if not IMAGE_GEN_URL:
+        return "[error] no image endpoint configured (set HERA_IMAGE_URL or HERA_API_URL)"
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return "[error] prompt is required"
+
+    # Dimensions travel in the OpenAI top-level `size` field; only the controls
+    # the OpenAI shape can't express (steps, CFG, negative prompt, seed) ride
+    # along in an `sd_cpp_extra_args` block, which sd-server parses out of the
+    # prompt and removes before generating.
+    norm_size = _parse_size(size)
+    extra = {}
+    sample = {}
+    if steps is not None:
+        sample["sample_steps"] = int(steps)
+    if cfg_scale is not None:
+        sample["guidance"] = {"txt_cfg": float(cfg_scale)}
+    if sample:
+        extra["sample_params"] = sample
+    if negative_prompt:
+        extra["negative_prompt"] = str(negative_prompt)
+    if seed is not None:
+        extra["seed"] = int(seed)
+    send_prompt = prompt
+    if extra:
+        send_prompt = f"{prompt} <sd_cpp_extra_args>{json.dumps(extra)}</sd_cpp_extra_args>"
+
+    body = {"model": IMAGE_GEN_MODEL, "prompt": send_prompt, "n": 1,
+            "output_format": "png"}
+    if norm_size:
+        body["size"] = f"{norm_size[0]}x{norm_size[1]}"
+    try:
+        resp = requests.post(
+            f"{IMAGE_GEN_URL}/images/generations", json=body,
+            headers={"Authorization": f"Bearer {API_KEY}",
+                     "Content-Type": "application/json"},
+            timeout=600,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.response.text[:300]
+        except Exception:  # noqa: BLE001
+            pass
+        return f"[error] image generation failed: {exc} {detail}".rstrip()
+    except requests.exceptions.RequestException as exc:
+        return f"[error] image generation failed: {exc}"
+
+    try:
+        data = resp.json().get("data") or []
+        b64 = data[0]["b64_json"]
+        raw = base64.b64decode(b64)
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        return f"[error] unexpected image response: {exc}"
+
+    if path:
+        out = _resolve(path)
+    else:
+        slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")[:40] or "image"
+        out = _resolve(f"{slug}-{int(time.time())}.png")
+    if not out.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+        out += ".png"
+    try:
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "wb") as f:
+            f.write(raw)
+    except OSError as exc:
+        return f"[error] could not save image: {exc}"
+    return f"saved image ({len(raw)} bytes) to {out}"
+
+
 TOOLS = {
     "list_dir":   tool_list_dir,
     "read_file":  tool_read_file,
@@ -2186,11 +2278,12 @@ TOOLS = {
     "move_path": tool_move_path,
     "delete_path": tool_delete_path,
     "run_bash":   tool_run_bash,
+    "generate_image": tool_generate_image,
 }
 
 # Tools that change the world → require approval (unless YOLO).
 SIDE_EFFECTS = {"write_file", "edit_file", "multi_edit", "apply_patch", "notebook_edit",
-                "move_path", "delete_path", "run_bash"}
+                "move_path", "delete_path", "run_bash", "generate_image"}
 
 TOOL_SCHEMAS = [
     {"type": "function", "function": {
@@ -2345,6 +2438,24 @@ TOOL_SCHEMAS = [
                 "later with bash_output. Default false.")},
         }, "required": ["command"]},
     }},
+    {"type": "function", "function": {
+        "name": "generate_image",
+        "description": (
+            "Generate an image from a text prompt using Stable Diffusion (SDXL) "
+            "and save it to disk. Returns the saved path. Use for creating "
+            "illustrations, mockups, diagrams-as-art, icons, or any visual asset "
+            "the task calls for."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "What to draw (be descriptive)"},
+            "path": {"type": "string", "description": "Where to save the PNG (default: a slug of the prompt in the cwd)"},
+            "size": {"type": "string", "description": "WIDTHxHEIGHT, e.g. '1024x1024' (default) or '1024x768'"},
+            "steps": {"type": "integer", "description": "Sampling steps (optional; server default if omitted)"},
+            "cfg_scale": {"type": "number", "description": "Prompt-adherence / CFG scale (optional)"},
+            "negative_prompt": {"type": "string", "description": "What to avoid in the image (optional)"},
+            "seed": {"type": "integer", "description": "Seed for reproducibility; omit for random (optional)"},
+        }, "required": ["prompt"]},
+    }},
 ]
 
 
@@ -2440,6 +2551,8 @@ def _narrate(name, args):
         return f"Fetching {args.get('url', '')}"
     if name == "task":
         return f"Delegating a sub-task: {args.get('description', '')[:60]}"
+    if name == "generate_image":
+        return f"Generating image: {args.get('prompt', '')[:60]}"
     return f"Calling {name}"
 
 

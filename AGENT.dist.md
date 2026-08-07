@@ -14,7 +14,14 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.54`.
+- **Version:** `0.8.55`.
+- **Stable Diffusion image generation.** A `generate_image` tool renders a prompt to a PNG via a
+  self-hosted Stable Diffusion (SDXL) server and saves it to disk — available in every surface (REPL,
+  `-p`, `--serve`, `--acp`, `--tui`) and to sub-agents, gated by the normal approval prompt. Args:
+  `prompt` (required), `path`, `size` (`1024x1024`), `steps`, `cfg_scale`, `negative_prompt`, `seed`.
+  It posts to the OpenAI-compatible `/v1/images/generations` route (set `HERA_IMAGE_URL` to override
+  the endpoint, `HERA_IMAGE_MODEL` the model id). The web chat (Open WebUI) image button uses the same
+  server. See `docs/STABLE_DIFFUSION.md`.
 - **ACP editor-native files + session resume.** `--acp` honours the client's `fs` capabilities: applies
   edits via `fs/write_text_file` and reads open buffers via `fs/read_text_file` when offered; advertises
   `loadSession` and replays a resumed conversation to the client. A full guide to the Grok-parity features

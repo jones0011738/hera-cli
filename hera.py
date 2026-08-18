@@ -156,7 +156,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.55"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.56"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -5863,6 +5863,31 @@ def _doctor_identity_check(timeout=6):
     return (f"{name} ({email})" if name else email), ""
 
 
+def _encoding_status():
+    """Doctor line for glyph rendering. Hera emits UTF-8 unless HERA_ASCII forces
+    ASCII; a terminal whose charset isn't UTF-8 garbles the ▌/✓/box glyphs, and
+    nothing server-side can detect the client's charset — so we always surface the
+    HERA_ASCII=1 escape hatch, and hard-fail the one case we CAN detect: a locale
+    naming a UTF-8 codeset the OS never generated.
+
+    Returns (ok, message)."""
+    if not _UTF8:
+        return True, f"ASCII mode (HERA_ASCII set) {SYM_EMDASH} plain-text glyphs, no garble"
+    installable = True
+    try:
+        prev = _locale.setlocale(_locale.LC_CTYPE)
+        try:
+            _locale.setlocale(_locale.LC_CTYPE, "")
+        finally:
+            _locale.setlocale(_locale.LC_CTYPE, prev)
+    except Exception:  # noqa: BLE001  (locale.Error and friends)
+        installable = False
+    if not installable:
+        return False, (f"locale names a UTF-8 codeset the OS hasn't generated "
+                       f"{SYM_MIDDOT} set HERA_ASCII=1, or run: sudo locale-gen $LANG")
+    return True, f"UTF-8 glyphs {SYM_MIDDOT} set HERA_ASCII=1 if they render garbled"
+
+
 def _run_doctor():
     """All-in-one: self-update + Docker stack health + CLI diagnostics/auto-fix."""
     ok_s   = f"{GREEN}{SYM_CHECK}{R}"
@@ -5935,6 +5960,8 @@ def _run_doctor():
         print(f"    {fail_s} identity    : {live_err}")
         print(f"    {fail_s} model       : {MODEL} {SYM_EMDASH} {live_err}")
     print(f"    {ok_s} sandbox     : {sandbox_label()}")
+    enc_ok, enc_msg = _encoding_status()
+    print(f"    {ok_s if enc_ok else warn_s} encoding    : {enc_msg}")
 
     try:
         emb_ok = embeddings_available()
@@ -8506,15 +8533,16 @@ def doctor():
                  + ("" if r.ok else f" {SYM_MIDDOT} {(r.text or '').strip()[:120]}"))
         except requests.exceptions.RequestException as exc:
             line(False, "model", f"unreachable: {exc}")
-        try:
-            resolve_identity()
-            line(bool(USER_EMAIL or USER_NAME), "identity", whoami_label())
-        except Exception:  # noqa: BLE001
-            line(True, "identity", USER_ID)
+        # Live /whoami (bypasses the on-disk identity cache) so an expired or
+        # revoked key fails RED here instead of showing a stale cached account.
+        live_id, live_err = _doctor_identity_check()
+        line(bool(live_id), "identity", live_id or live_err)
         vision_ok, vision_detail = _vision_doctor_summary(timeout=4.0)
         line(vision_ok, "vision", vision_detail)
 
     line(True, "sandbox", sandbox_label())
+    enc_ok, enc_msg = _encoding_status()
+    line(enc_ok, "encoding", enc_msg)
     line(True, "context", f"auto-compacts near {CONTEXT_TOKENS} tok, and self-recovers on overflow")
     if updated:
         print(f"\n  {GREEN}Updated {SYM_EMDASH} re-run `hera` to use the new version.{R}\n")

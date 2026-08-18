@@ -14,7 +14,14 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.55`.
+- **Version:** `0.8.56`.
+- **Doctor now fails honestly + encoding hint.** `hera doctor`'s **identity** check does a **live**
+  `/whoami` (via `_doctor_identity_check()`) instead of reading the on-disk identity cache — so an
+  expired/revoked key shows **red** on both `identity` and `model` instead of a stale-cached account
+  masking the failure. A new **encoding** line (`_encoding_status()`) reports whether the terminal
+  renders UTF-8, surfaces the `HERA_ASCII=1` escape hatch for garbled glyphs, and goes red when the
+  locale names a UTF-8 codeset the OS hasn't generated. Also fixed seven f-strings where `{SYM_*}`
+  glyphs sat inside plain (non-`f`) inner literals and printed as literal text (`{SYM_ELLIPSIS}` etc.).
 - **Stable Diffusion image generation.** A `generate_image` tool renders a prompt to a PNG via a
   self-hosted Stable Diffusion (SDXL) server and saves it to disk — available in every surface (REPL,
   `-p`, `--serve`, `--acp`, `--tui`) and to sub-agents, gated by the normal approval prompt. Args:

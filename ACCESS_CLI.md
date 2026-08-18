@@ -397,6 +397,7 @@ chat is using.
 | `HERA_VISION_URL` | = `HERA_API_URL` | Optional override for attached-image turns. By default Hera uses the same API URL and falls back to local OCR/metadata if image inference fails. |
 | `HERA_VISION_MODEL` | = `HERA_MODEL` | Optional model name override for `HERA_VISION_URL`. |
 | `HERA_NO_COLOR` / `HERA_FORCE_COLOR` | `0` | Disable / force colour. |
+| `HERA_ASCII` | `0` | `1` = force plain-ASCII glyphs (`|`, `-`, `*`, `->`) instead of Unicode. Set this if the UI renders garbled (e.g. `â–Œ`, `âœ"`, `Â·`) because your terminal isn't UTF-8. |
 | `HERA_SANDBOX` | `auto` | `auto` / `bwrap` / `unshare` / `none`. |
 | `HERA_SANDBOX_NET` | `1` | `0` = block network in the sandbox. |
 | `HERA_ALLOW` / `HERA_DENY` | _(empty)_ | `run_bash` allow / extra-deny patterns. |
@@ -410,7 +411,7 @@ chat is using.
 
 ## 6. Keeping Hera up to date
 
-The current release is **0.8.45**. On launch Hera checks the published version (at most once a
+The current release is **0.8.56**. On launch Hera checks the published version (at most once a
 day, fail-silent — it never blocks or errors startup). If a newer one is out, you'll see a
 one-line notice like:
 
@@ -434,13 +435,16 @@ $ hera doctor
   ✓ identity     Your Name (you@example.com)
   ✓ vision       auto via proxy — healthy  qwen2.5-vl-7b-instruct  model: present  mmproj: present
   ✓ sandbox      bwrap — fs confined to cwd, network on
+  ✓ encoding     UTF-8 glyphs · set HERA_ASCII=1 if they render garbled
   ✓ context      auto-compacts near 131072 tok, and self-recovers on overflow
 ```
 
-The **identity** line shows the real account the key belongs to (your name + email, fetched live
-from `/whoami`) — so every surface greets *you*. The **vision** line checks the default multimodal
-route through `auth-proxy`, including whether `vision-server` is healthy and whether its model +
-projector files are present. `hera doctor --force` re-downloads even if you're already current. Or
+The **identity** line shows the real account the key belongs to (your name + email, fetched **live**
+from `/whoami` — a stale cached login can't mask an expired key). The **vision** line checks the
+default multimodal route through `auth-proxy`, including whether `vision-server` is healthy and
+whether its model + projector files are present. The **encoding** line reports how glyphs render: if
+your terminal isn't UTF-8 the Unicode UI garbles (`â–Œ`, `âœ"`, `Â·`) — set `HERA_ASCII=1` for a
+plain-text UI. It goes **red** if your locale names a UTF-8 codeset the OS hasn't generated. `hera doctor --force` re-downloads even if you're already current. Or
 update manually — re-run the one-line installer from step 2, or pull the latest single file:
 
 ```bash
@@ -466,6 +470,7 @@ the notice.
 | `Cannot reach …:8090` | Proxy down or firewall. Check `curl http://<HOST>:8090/health`. |
 | `'requests' not found` | `pip install requests`. |
 | Long silent `thinking…` | It's a reasoning model; `/reasoning` toggles visibility or set `HERA_HIDE_REASONING=1`. |
+| Garbled glyphs (`â–Œ`, `âœ"`, `Â·`, `â€"`) | Your terminal/locale isn't UTF-8, so Hera's Unicode UI is decoded as Latin-1/CP1252. Set `HERA_ASCII=1` (add to `~/.bashrc`) for a plain-text UI, or make the box UTF-8: `sudo locale-gen en_US.UTF-8 && sudo update-locale LANG=en_US.UTF-8`, then re-login. `hera doctor`'s **encoding** line flags this. |
 
 ---
 

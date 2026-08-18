@@ -411,7 +411,7 @@ chat is using.
 
 ## 6. Keeping Hera up to date
 
-The current release is **0.8.56**. On launch Hera checks the published version (at most once a
+The current release is **0.8.57**. On launch Hera checks the published version (at most once a
 day, fail-silent — it never blocks or errors startup). If a newer one is out, you'll see a
 one-line notice like:
 
@@ -470,7 +470,36 @@ the notice.
 | `Cannot reach …:8090` | Proxy down or firewall. Check `curl http://<HOST>:8090/health`. |
 | `'requests' not found` | `pip install requests`. |
 | Long silent `thinking…` | It's a reasoning model; `/reasoning` toggles visibility or set `HERA_HIDE_REASONING=1`. |
-| Garbled glyphs (`â–Œ`, `âœ"`, `Â·`, `â€"`) | Your terminal/locale isn't UTF-8, so Hera's Unicode UI is decoded as Latin-1/CP1252. Set `HERA_ASCII=1` (add to `~/.bashrc`) for a plain-text UI, or make the box UTF-8: `sudo locale-gen en_US.UTF-8 && sudo update-locale LANG=en_US.UTF-8`, then re-login. `hera doctor`'s **encoding** line flags this. |
+| Garbled glyphs (`â–Œ`, `âœ"`, `Â·`, `â€"`) | Your terminal isn't UTF-8, so Hera's Unicode UI is decoded as Latin-1/CP1252. See **Garbled UI** below. `hera doctor`'s **encoding** line and the banner both flag it. |
+
+### Garbled UI (`â–Œ`, `âœ"`, `Â·`, `â€"`)
+
+Hera draws its UI with Unicode (box-drawing, `▌`, `✓`, `·`, `—`). If your terminal isn't decoding
+UTF-8, each of those glyphs shows up as several Latin-1/CP1252 characters — e.g. `▌` → `â–Œ`,
+`✓` → `âœ"`, `·` → `Â·`. The bytes Hera sends are correct UTF-8; the **terminal** is misreading them.
+Two ways to fix it:
+
+**1. Downgrade Hera's glyphs — works no matter the terminal.**
+
+```bash
+echo 'export HERA_ASCII=1' >> ~/.bashrc && export HERA_ASCII=1
+```
+
+Hera then uses plain ASCII (`|`, `-`, `*`, `->`). Run `hera doctor` afterward — the **encoding**
+line reads `ASCII mode (HERA_ASCII set) -- plain-text glyphs, no garble`.
+
+**2. Make the terminal UTF-8 — keeps the nicer Unicode UI.**
+
+The culprit is the client you connect *through*, not the server (the box's own locale is usually
+fine):
+
+- **Web / cloud SSH console:** many render Latin-1. Connect from a real UTF-8 terminal instead:
+  `ssh ubuntu@<HOST>`.
+- **PuTTY:** Window → Translation → Remote character set → **UTF-8**, then reconnect.
+- **tmux / screen:** start them in UTF-8 mode — `tmux -u` / `screen -U`.
+
+> `hera doctor`'s **encoding** line stays green when the *box* locale is valid UTF-8 (it can't see
+> your client's charset), so it always prints the `HERA_ASCII=1` hint rather than guessing.
 
 ---
 

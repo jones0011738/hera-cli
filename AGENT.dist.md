@@ -14,7 +14,12 @@ endpoint. It runs the model in a reason→act loop with real tools and a permiss
 aiming for Claude-Code-class behavior.
 
 ## Latest changes
-- **Version:** `0.8.56`.
+- **Version:** `0.8.57`.
+- **Banner garbled-UI hint.** The startup banner now prints a one-line, **ASCII-only** note
+  (suppressed in `HERA_ASCII` mode) telling users whose terminal garbles the Unicode UI to
+  `export HERA_ASCII=1` — kept ASCII so it stays legible even amid the garble. Full fixes (ASCII
+  downgrade + making the terminal UTF-8: web-console/ssh, PuTTY, tmux/screen) are in
+  `ACCESS_CLI.md` → Troubleshooting → **Garbled UI**.
 - **Doctor now fails honestly + encoding hint.** `hera doctor`'s **identity** check does a **live**
   `/whoami` (via `_doctor_identity_check()`) instead of reading the on-disk identity cache — so an
   expired/revoked key shows **red** on both `identity` and `model` instead of a stale-cached account

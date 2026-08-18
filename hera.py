@@ -5575,10 +5575,10 @@ def register_extensions(quiet=False):
     if plugins:
         print(f"{DIM}[ext] loaded {len(plugins)} plugin(s): "
               f"{', '.join(p['name'] for p in plugins[:6])}"
-              f"{'{SYM_ELLIPSIS}' if len(plugins) > 6 else ''}{R}", file=out)
+              f"{SYM_ELLIPSIS if len(plugins) > 6 else ''}{R}", file=out)
     if mcp:
         print(f"{DIM}[ext] loaded {len(mcp)} MCP tool(s): {', '.join(mcp[:6])}"
-              f"{'{SYM_ELLIPSIS}' if len(mcp) > 6 else ''}{R}", file=out)
+              f"{SYM_ELLIPSIS if len(mcp) > 6 else ''}{R}", file=out)
     if custom:
         print(f"{DIM}[ext] loaded {len(custom)} custom tool(s): {', '.join(custom)}{R}", file=out)
     if register_semantic_search():
@@ -5832,6 +5832,37 @@ def _self_update(cli_base):
         return False, str(e)
 
 
+def _doctor_identity_check(timeout=6):
+    """Live key validation for doctor: hit the proxy's /whoami with the current
+    key, bypassing the on-disk identity cache, so an expired/revoked key shows
+    red here instead of being masked by a previously cached account.
+
+    Returns (label, "") on success or ("", reason) on failure."""
+    if not API_URL:
+        return "", "HERA_API_URL not set"
+    if not API_KEY:
+        return "", "no API key configured"
+    try:
+        r = requests.get(_whoami_url(), timeout=timeout,
+                         headers={"Authorization": f"Bearer {API_KEY}",
+                                  "User-Agent": _WEB_UA})
+    except requests.exceptions.RequestException as e:
+        return "", f"proxy unreachable: {e}"
+    if r.status_code == 401:
+        return "", "key rejected (invalid/expired Open WebUI key)"
+    if not r.ok:
+        return "", f"HTTP {r.status_code}: {(r.text or '').strip()[:120]}"
+    try:
+        data = r.json() or {}
+    except ValueError:
+        return "", "invalid response from proxy"
+    email = (data.get("email") or "").strip()
+    name = (data.get("name") or "").strip()
+    if not email:
+        return "", "proxy returned no identity"
+    return (f"{name} ({email})" if name else email), ""
+
+
 def _run_doctor():
     """All-in-one: self-update + Docker stack health + CLI diagnostics/auto-fix."""
     ok_s   = f"{GREEN}{SYM_CHECK}{R}"
@@ -5857,7 +5888,7 @@ def _run_doctor():
                     print("    downloading…", end="", flush=True)
                     ok, err = _self_update(cli_base)
                     print(f"\r    {fix_s if ok else fail_s} "
-                          f"{'updated {SYM_EMDASH} restart hera to apply' if ok else f'failed: {err}'}")
+                          f"{f'updated {SYM_EMDASH} restart hera to apply' if ok else f'failed: {err}'}")
         except Exception as e:
             print(f"    {warn_s} version check failed: {e}")
     else:
@@ -5891,8 +5922,18 @@ def _run_doctor():
     print(f"\n  {BOLD}CLI diagnostics{R}")
 
     print(f"    {ok_s if API_KEY else fail_s} API key     : "
-          f"{'set' if API_KEY else 'NOT SET {SYM_EMDASH} run hera to configure'}")
-    print(f"    {ok_s} model       : {MODEL}")
+          f"{'set' if API_KEY else f'NOT SET {SYM_EMDASH} run hera to configure'}")
+
+    # Live key/identity check — actually hit the proxy so an expired or revoked
+    # key fails HERE (red) instead of being masked by a previously cached
+    # account. This is the check that catches "invalid Open WebUI key" 401s.
+    live_id, live_err = _doctor_identity_check()
+    if live_id:
+        print(f"    {ok_s} identity    : {live_id}")
+        print(f"    {ok_s} model       : {MODEL} (key valid)")
+    else:
+        print(f"    {fail_s} identity    : {live_err}")
+        print(f"    {fail_s} model       : {MODEL} {SYM_EMDASH} {live_err}")
     print(f"    {ok_s} sandbox     : {sandbox_label()}")
 
     try:
@@ -5900,7 +5941,7 @@ def _run_doctor():
     except Exception:
         emb_ok = False
     print(f"    {ok_s if emb_ok else warn_s} embeddings  : "
-          f"{'enabled (semantic_search active)' if emb_ok else 'disabled {SYM_EMDASH} set HERA_EMBED_URL'}")
+          f"{'enabled (semantic_search active)' if emb_ok else f'disabled {SYM_EMDASH} set HERA_EMBED_URL'}")
 
     print(f"    {ok_s if WEB_ENABLED else warn_s} web search  : "
           f"{'on (' + SEARCH_PROVIDER + ')' if WEB_ENABLED else 'off (HERA_NO_WEB=1)'}")
@@ -8649,7 +8690,7 @@ def _builtin_statusline():
         parts.append(f"auto:{AUTO_MODE}")
     if THINK_LEVEL not in ("normal", ""):
         parts.append(f"think:{THINK_LEVEL}")
-    print(f"{DIM}{'  {SYM_MIDDOT}  '.join(parts)}{R}")
+    print(f"{DIM}{f'  {SYM_MIDDOT}  '.join(parts)}{R}")
 
 
 def _render_statusline():
@@ -8797,7 +8838,7 @@ def _repl(messages, spinner):
                         if p["mcp"]:
                             bits.append("mcp")
                         print(f"  {CYAN}{p['name']}{R} {DIM}{p['version']} "
-                              f"{'{SYM_MIDDOT} '.join(bits)} {SYM_EMDASH} {p['description']}{R}")
+                              f"{f'{SYM_MIDDOT} '.join(bits)} {SYM_EMDASH} {p['description']}{R}")
                     print()
             continue
         if cmd == "/doctor":

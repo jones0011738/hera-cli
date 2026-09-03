@@ -23,7 +23,8 @@ model's reasoning, tracks tokens, and saves resumable per-user sessions.
 
 Ports you may touch: **`:8081`** download host (installer + `hera.py`), **`:8090`** the identity
 proxy Hera actually calls (`/v1`, `/whoami`, `/health`), **`:3000`** the web UI where you mint your
-key. The installer derives `:8090` from the `:8081` host automatically, so normally you only ever
+key. Optional: **`:8443`** is the same proxy over HTTPS (see *Optional: use HTTPS instead of HTTP*
+below). The installer derives `:8090` from the `:8081` host automatically, so normally you only ever
 type the `:8081` one-liner.
 
 ### TL;DR (already approved, Linux/macOS)
@@ -56,6 +57,31 @@ from everyone else's.
 > ```
 > A `200` from `/health` means the proxy is up; a good `/whoami` means your key is valid **and**
 > approved. A `403` there means your account is still `pending` (ask the admin); `401` means a bad key.
+
+### Optional: use HTTPS instead of HTTP
+
+Plain HTTP on **`:8090`** keeps working exactly as documented here — nothing below is required. If you'd
+rather encrypt the connection, the same proxy is also served over TLS on **`:8443`** by a `tls-gateway`
+(identical `/v1`, `/whoami`, `/health`, same key). It uses a private (Caddy internal) CA, so trust its
+root cert once — it's public-safe (a root cert, no private key):
+
+```bash
+# 1. Fetch the CA once (served on the same :8081 install host)
+curl -fsSL http://<HOST>:8081/gateway-ca.crt -o ~/.config/hera/gateway-ca.crt
+
+# 2. Point the CLI at the HTTPS endpoint and tell requests to trust that CA
+export HERA_API_URL=https://<HOST>:8443/v1
+export REQUESTS_CA_BUNDLE=~/.config/hera/gateway-ca.crt   # requests honours this — no code change
+hera
+
+# quick check:
+curl --cacert ~/.config/hera/gateway-ca.crt https://<HOST>:8443/health   # → {"status": "ok"}
+```
+
+Prefer not to set `REQUESTS_CA_BUNDLE` each time? Trust the CA OS-wide instead
+(`sudo cp gateway-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates` on Debian/Ubuntu),
+then just `HERA_API_URL=https://<HOST>:8443/v1` is enough. For stronger assurance than fetching the CA over
+plain HTTP, `scp` it off the host instead.
 
 ---
 

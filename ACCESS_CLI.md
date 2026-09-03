@@ -61,27 +61,36 @@ from everyone else's.
 ### Optional: use HTTPS instead of HTTP
 
 Plain HTTP on **`:8090`** keeps working exactly as documented here — nothing below is required. If you'd
-rather encrypt the connection, the same proxy is also served over TLS on **`:8443`** by a `tls-gateway`
-(identical `/v1`, `/whoami`, `/health`, same key). It uses a private (Caddy internal) CA, so trust its
-root cert once — it's public-safe (a root cert, no private key):
+rather encrypt the connection, the same proxy is also served over TLS on **`:8443`** (identical `/v1`,
+`/whoami`, `/health`, same key).
+
+**The easy way — the public domain, nothing to trust.** Just point the CLI at the domain; the cert is a
+real Let's Encrypt cert that your OS already trusts:
 
 ```bash
-# 1. Fetch the CA once (served on the same :8081 install host)
-curl -fsSL http://<HOST>:8081/gateway-ca.crt -o ~/.config/hera/gateway-ca.crt
+export HERA_API_URL=https://genomemind.servernah.ai:8443/v1
+hera
 
-# 2. Point the CLI at the HTTPS endpoint and tell requests to trust that CA
+# quick check (no --cacert needed):
+curl https://genomemind.servernah.ai:8443/health   # → {"status": "ok"}
+```
+
+If a tool ever fails with `x509: certificate signed by unknown authority` or `certificate verify failed`,
+it's connecting by **IP** (the self-signed fallback below) — switch it to the domain and the error goes away.
+
+**Fallback — bare IP, self-signed CA.** Only if you must use the IP instead of the domain. Trust the CA once:
+
+```bash
+# Fetch the public-safe root cert (no private key), served on the :8081 install host
+curl -fsSL http://<HOST>:8081/gateway-ca.crt -o ~/.config/hera/gateway-ca.crt
 export HERA_API_URL=https://<HOST>:8443/v1
 export REQUESTS_CA_BUNDLE=~/.config/hera/gateway-ca.crt   # requests honours this — no code change
 hera
-
-# quick check:
-curl --cacert ~/.config/hera/gateway-ca.crt https://<HOST>:8443/health   # → {"status": "ok"}
 ```
 
-Prefer not to set `REQUESTS_CA_BUNDLE` each time? Trust the CA OS-wide instead
-(`sudo cp gateway-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates` on Debian/Ubuntu),
-then just `HERA_API_URL=https://<HOST>:8443/v1` is enough. For stronger assurance than fetching the CA over
-plain HTTP, `scp` it off the host instead.
+Prefer not to set `REQUESTS_CA_BUNDLE`? Trust the CA OS-wide instead (works for every client, not just
+Python): `sudo cp gateway-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates` on
+Debian/Ubuntu — then just `HERA_API_URL=https://<HOST>:8443/v1` is enough.
 
 ---
 

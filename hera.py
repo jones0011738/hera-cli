@@ -156,7 +156,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.57"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.58"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -3206,8 +3206,31 @@ def stream_turn(messages, spinner, tools=None, model_override=None):
                 compacted = True
                 spinner.start()
                 continue  # doesn't count as a failed attempt
+            # An expired/invalid Open WebUI key. Offer an inline sign-in and
+            # retry once, so a lapsed JWT doesn't dead-end the turn (and the
+            # user isn't left hand-editing config.json). One retry only.
+            if code == 401:
+                spinner.stop()
+                status = _jwt_exp_status(API_KEY)
+                why = f" — your key {status}" if status.startswith("EXPIRED") else ""
+                print(f"{RED}[error] 401 Unauthorized{R} "
+                      f"{DIM}{SYM_EMDASH} Open WebUI key invalid or expired{why}.{R}",
+                      file=sys.stderr)
+                if attempt == 0 and sys.stdin.isatty():
+                    print(f"{DIM}  sign in again with your Open WebUI email + password:{R}",
+                          file=sys.stderr)
+                    ok, msg = login()
+                    mark = f"{GREEN}{SYM_CHECK}" if ok else f"{RED}{SYM_CROSS}"
+                    print(f"  {mark}{R} {msg}", file=sys.stderr)
+                    if ok:
+                        attempt += 1  # cap the retry so a bad key can't loop
+                        spinner.start()
+                        continue
+                else:
+                    print(f"{DIM}  run `hera login` to sign in again.{R}", file=sys.stderr)
+                return None
             if code and code < 500:
-                spinner.stop()  # other 4xx (401/403) won't fix itself — don't retry
+                spinner.stop()  # other 4xx (403 etc.) won't fix itself — don't retry
                 print(f"{RED}[error] {exc}{R}\n", file=sys.stderr)
                 return None
         except requests.exceptions.ConnectionError as exc:
@@ -4746,6 +4769,39 @@ def whoami_label():
     return USER_EMAIL or USER_NAME or "(not signed in)"
 
 
+def _jwt_exp(token):
+    """A JWT's `exp` (unix seconds) if `token` is a decodable JWT, else None.
+
+    No signature check — the server stays the authority on validity. This only
+    lets the client SURFACE expiry (in `doctor` and on a 401) instead of the
+    old failure mode: 'api key ✓ set' while every request 401s on a token that
+    lapsed days ago."""
+    try:
+        seg = token.split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        return int(json.loads(base64.urlsafe_b64decode(seg))["exp"])
+    except (AttributeError, ValueError, KeyError, IndexError, TypeError,
+            json.JSONDecodeError):
+        return None
+
+
+def _jwt_exp_status(token):
+    """Human phrase for a key's expiry — 'expires in 12d', 'EXPIRED 7d ago' —
+    or "" for a non-JWT / undated key (e.g. a static `sk-` API key)."""
+    exp = _jwt_exp(token)
+    if not exp:
+        return ""
+    delta = exp - int(time.time())
+    secs = abs(delta)
+    if secs >= 86400:
+        amt = f"{secs // 86400}d"
+    elif secs >= 3600:
+        amt = f"{secs // 3600}h"
+    else:
+        amt = f"{max(1, secs // 60)}m"
+    return f"EXPIRED {amt} ago" if delta < 0 else f"expires in {amt}"
+
+
 def _whoami_url():
     """The proxy's identity endpoint, derived from the API URL (strip /v1)."""
     base = API_URL[:-3] if API_URL.endswith("/v1") else API_URL
@@ -5849,7 +5905,9 @@ def _doctor_identity_check(timeout=6):
     except requests.exceptions.RequestException as e:
         return "", f"proxy unreachable: {e}"
     if r.status_code == 401:
-        return "", "key rejected (invalid/expired Open WebUI key)"
+        status = _jwt_exp_status(API_KEY)
+        hint = f" ({status})" if status else ""
+        return "", f"key rejected{hint} {SYM_EMDASH} run `hera login`"
     if not r.ok:
         return "", f"HTTP {r.status_code}: {(r.text or '').strip()[:120]}"
     try:
@@ -8477,6 +8535,58 @@ def logout():
     SESSIONS_DIR = _sessions_dir_for(USER_ID)
 
 
+def login(email=None, interactive=True):
+    """Sign in / refresh the Open WebUI key WITHOUT sshing to the box.
+
+    Open WebUI issues short-lived JWTs (~28d), so a key silently lapses and
+    every request then 401s. This exchanges email + password for a fresh token
+    via the proxy's `POST /v1/auth/refresh` (the proxy forwards to Open WebUI's
+    signin and never stores or logs the password), then persists the new key +
+    identity and updates THIS process so the running session keeps working.
+
+    Returns (ok, message). Reused by the on-401 auto-recovery in the chat loop.
+    """
+    global API_KEY, USER_EMAIL
+    import getpass
+    if not API_URL:
+        return False, "no endpoint configured — run `hera` once to set it"
+    if not interactive or not sys.stdin.isatty():
+        return False, "not a tty — run `hera login` interactively (or set HERA_API_KEY)"
+    email = (email or USER_EMAIL or "").strip()
+    try:
+        entered = input(f"{BOLD}  Email{f' [{email}]' if email else ''}: {R}").strip()
+        if entered:
+            email = entered
+        password = getpass.getpass("  Password: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False, "cancelled"
+    if not email or not password:
+        return False, "email and password are both required"
+    try:
+        r = requests.post(f"{API_URL}/auth/refresh",
+                          json={"email": email, "password": password},
+                          headers={"Content-Type": "application/json"}, timeout=15)
+    except requests.exceptions.RequestException as e:
+        return False, f"could not reach proxy: {e}"
+    if r.status_code == 401:
+        return False, "signin rejected by Open WebUI (wrong email/password?)"
+    if not r.ok:
+        return False, f"HTTP {r.status_code}: {(r.text or '').strip()[:120]}"
+    try:
+        data = r.json() or {}
+    except ValueError:
+        return False, "proxy returned a non-JSON response"
+    token = (data.get("token") or "").strip()
+    if not token:
+        return False, "proxy returned no token"
+    API_KEY = token
+    USER_EMAIL = (data.get("email") or email).strip()
+    save_config({"api_key": token, "user": USER_EMAIL})
+    status = _jwt_exp_status(token)
+    return True, f"signed in as {USER_EMAIL}" + (f" {SYM_MIDDOT} {status}" if status else "")
+
+
 def _self_update(force=False):
     """Download the latest hera.py over the currently-running file.
 
@@ -8526,7 +8636,19 @@ def doctor():
     updated = status is True
 
     line(bool(API_URL), "endpoint", API_URL or "(unset — run `hera` to set it)")
-    line(bool(API_KEY), "api key", "set" if API_KEY else "(unset)")
+    # Decode the key's own expiry so a lapsed JWT reads RED here — instead of
+    # the old 'api key ✓ set' that masked a token which expired days ago.
+    key_status = _jwt_exp_status(API_KEY) if API_KEY else ""
+    key_expired = key_status.startswith("EXPIRED")
+    if not API_KEY:
+        key_note = "(unset)"
+    elif key_expired:
+        key_note = f"set but {key_status} {SYM_EMDASH} run `hera login`"
+    elif key_status:
+        key_note = f"set {SYM_MIDDOT} {key_status}"
+    else:
+        key_note = "set"
+    line(bool(API_KEY) and not key_expired, "api key", key_note)
 
     if API_URL and API_KEY:
         try:
@@ -8562,7 +8684,7 @@ def main():
     ap = argparse.ArgumentParser(prog="hera", add_help=True,
                                  description="Hera — agentic coding CLI")
     ap.add_argument("command", nargs="?", default=None,
-                    help="doctor · logout · whoami · mcp-login <server>")
+                    help="doctor · login · logout · whoami · mcp-login <server>")
     ap.add_argument("extra", nargs="?", default=None, help="argument for `command` (e.g. server name)")
     ap.add_argument("--resume", "-r", nargs="?", const="__latest__", default=None,
                     metavar="ID", help="resume a saved session (latest if no ID)")
@@ -8606,6 +8728,11 @@ def main():
     if args.command == "doctor":
         doctor()
         return
+    if args.command == "login":
+        ok, msg = login()
+        mark = f"{GREEN}{SYM_CHECK}" if ok else f"{RED}{SYM_CROSS}"
+        print(f"{mark}{R} {msg}")
+        sys.exit(0 if ok else 1)
     if args.command == "logout":
         logout()
         print(f"{GREEN}{SYM_CHECK} logged out{R} {DIM}{SYM_EMDASH} key and identity cleared from {CONFIG_PATH}. "
@@ -8620,7 +8747,8 @@ def main():
         return
     if args.command:
         print(f"{RED}[error] unknown command {args.command!r}. "
-              f"Try: hera doctor {SYM_MIDDOT} hera logout {SYM_MIDDOT} hera whoami {SYM_MIDDOT} hera mcp-login <server>{R}",
+              f"Try: hera doctor {SYM_MIDDOT} hera login {SYM_MIDDOT} hera logout {SYM_MIDDOT} hera whoami "
+              f"{SYM_MIDDOT} hera mcp-login <server>{R}",
               file=sys.stderr)
         return
 

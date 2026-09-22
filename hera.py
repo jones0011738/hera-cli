@@ -156,7 +156,7 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.59"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.60"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
@@ -8471,12 +8471,39 @@ def check_for_update():
               f"  {DIM}{how}{R}\n")
 
 
+def _validate_api_key(key):
+    """Gate an onboarding credential. Setup takes an Open WebUI *API key* and
+    nothing else: a non-expiring `sk-…` from Settings → Account → API Keys.
+
+    A pasted session JWT (`eyJ…`) is rejected on sight — storing one is exactly
+    what silently lapses and 401s every request (the failure that started all
+    this). When the endpoint is known we also do a best-effort live check so a
+    wrong/revoked key is caught here, not mid-task; a transient network error
+    doesn't block setup. Returns (ok, reason)."""
+    if key.startswith("eyJ") or key.count(".") == 2:
+        return False, ("that's a session token, not an API key. In Open WebUI open "
+                       f"Settings {SYM_ARROW_R} Account {SYM_ARROW_R} API Keys and create one "
+                       "(it starts with `sk-`).")
+    if not key.startswith("sk-"):
+        return False, ("that doesn't look like an Open WebUI API key. Generate one at "
+                       f"Settings {SYM_ARROW_R} Account {SYM_ARROW_R} API Keys (it starts with `sk-`).")
+    if API_URL:
+        try:
+            r = requests.get(_whoami_url(), timeout=8,
+                             headers={"Authorization": f"Bearer {key}", "User-Agent": _WEB_UA})
+            if r.status_code == 401:
+                return False, "the server rejected that key (invalid or revoked). Generate a fresh one."
+        except requests.exceptions.RequestException:
+            pass  # don't fail setup on a transient network blip — the key format is fine
+    return True, ""
+
+
 def onboard():
     """First-run setup: if the endpoint/key are missing, capture them once and
     persist to the config file so the user never has to export env vars.
 
     The installer pre-writes `api_url`, so in the normal flow the user only
-    pastes their key. Env vars still override everything.
+    pastes their Open WebUI API key (`sk-…`). Env vars still override everything.
     """
     global API_URL, API_KEY
     if API_URL and API_KEY:
@@ -8498,15 +8525,21 @@ def onboard():
         API_URL = url
 
     if not API_KEY:
-        print(f"\n{DIM}Your personal API key from Open WebUI {SYM_ARROW_R} Settings {SYM_ARROW_R} Account {SYM_ARROW_R} API Keys.{R}")
-        try:
-            key = input(f"{BOLD}  Paste your API key: {R}").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return False
-        if not key:
-            return False
-        API_KEY = key
+        print(f"\n{DIM}Your personal API key from Open WebUI {SYM_ARROW_R} Settings {SYM_ARROW_R} Account "
+              f"{SYM_ARROW_R} API Keys {SYM_EMDASH} it starts with {R}{BOLD}sk-{R}{DIM}.{R}")
+        while True:
+            try:
+                key = input(f"{BOLD}  Paste your API key: {R}").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return False
+            if not key:
+                return False
+            ok, why = _validate_api_key(key)
+            if ok:
+                API_KEY = key
+                break
+            print(f"  {RED}{SYM_CROSS}{R} {why}")
 
     save_config({"api_url": API_URL, "api_key": API_KEY})
     print(f"\n{GREEN}{SYM_CHECK} saved to {CONFIG_PATH}{R} {DIM}{SYM_EMDASH} you're set; this won't ask again.{R}\n")

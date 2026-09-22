@@ -11,7 +11,7 @@ token usage.
 Required:       HERA_API_URL  (the endpoint, e.g. http://<host>:8080/v1 — no host is
                               baked in, so this file can live in a public repo)
                 HERA_API_KEY  (bearer key the server enforces)
-Optional:       HERA_MODEL          (default qwen3.6-35b-a3b)
+Optional:       HERA_MODEL          (default huihui-qwen3.8-27b-abliterated)
                 HERA_NAME           (assistant display name; default Hera)
                 HERA_YOLO=1         auto-approve every tool call (no prompts)
                 HERA_MAX_STEPS      max tool round-trips per message (default: unlimited)
@@ -156,13 +156,13 @@ def save_config(updates):
         pass
 
 
-VERSION = "0.8.58"   # bump on every released change; mirrored in cli/VERSION
+VERSION = "0.8.59"   # bump on every released change; mirrored in cli/VERSION
 NAME    = _env("HERA_NAME", default="Hera")
 # No server host is baked into the source (so this repo can be public, revealing
 # neither key nor host). Each user supplies the endpoint + key once — via env
 # vars, the installer-written config file, or the first-run paste prompt.
 API_URL = _cfg("HERA_API_URL", "QWEN_API_URL", key="api_url", default="").rstrip("/")
-MODEL   = _env("HERA_MODEL",   "QWEN_MODEL",   default="qwen3.6-35b-a3b")
+MODEL   = _env("HERA_MODEL",   "QWEN_MODEL",   default="huihui-qwen3.8-27b-abliterated")
 API_KEY = _cfg("HERA_API_KEY", "QWEN_API_KEY", "LLAMA_API_KEY", key="api_key", default="")
 
 # Provider backend. "openai" (default) talks to any OpenAI-compatible endpoint

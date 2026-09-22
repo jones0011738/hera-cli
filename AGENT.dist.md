@@ -59,7 +59,7 @@ aiming for Claude-Code-class behavior.
   subtasks with `task(tasks=[…])`, at most `HERA_SUBAGENT_POOL` (default 8) run concurrently; the rest
   queue and start as slots free. Add `inherit_context: true` to pass each sub-agent a short slice of the
   current conversation (overall goal + latest progress) so it understands the bigger picture.
-- **Model is a reasoning model** — `qwen3.6-35b-a3b` returns `reasoning_content` (thinking) separately
+- **Model is a reasoning model** — `huihui-qwen3.8-27b-abliterated` returns `reasoning_content` (thinking) separately
   from `content` (final answer), thinking first. With a small `max_tokens` the budget can be spent on
   reasoning before any `content` is produced, so `content` comes back empty with `finish_reason=length`
   — not a fault, just needs more headroom (`max_tokens >= 200` when smoke-testing). `completion_tokens`

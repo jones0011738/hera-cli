@@ -296,7 +296,7 @@ the live catalog the proxy is serving.
 | `HERA_API_URL` | _(required)_ | Endpoint, e.g. `http://<host>:8080/v1` (given to you on approval). No host is baked into the code. |
 | `HERA_API_KEY` | _(empty)_ | **Required** bearer key. Missing → `401`. |
 | `HERA_USER` | _(resolved from key)_ | Override the session label. Normally unset — the key's account email is fetched from the proxy automatically. |
-| `HERA_MODEL` | `qwen3.6-35b-a3b` | Model name sent to the API |
+| `HERA_MODEL` | `huihui-qwen3.8-27b-abliterated` | Model name sent to the API |
 | `HERA_NAME` | `Hera` | Assistant display name |
 | `HERA_YOLO` | `0` | `1` = auto-approve every tool call (sandbox only) |
 | `HERA_MAX_STEPS` | `0` | Max tool round-trips per message (`0` = unlimited; set a number to cap) |
